@@ -10,3 +10,11 @@ ron = "0.8"
 serde = { version = "1", features = ["derive"] }
 smallvec = "1.13"
 thiserror = "2"
+
+[features]
+demo_2d = ["bevy/2d"]
+
+[[example]]
+name = "comprehensive_2d"
+path = "examples/comprehensive_2d.rs"
+required-features = ["demo_2d"]

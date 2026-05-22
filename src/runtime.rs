@@ -9,6 +9,7 @@ use bevy::prelude::{Entity, Resource, World};
 pub struct PendingSkillExecutions {
     next_execution_id: u64,
     pending: Vec<PendingSkillExecution>,
+    emitted: Vec<SkillRuntimeEvent>,
 }
 
 impl PendingSkillExecutions {
@@ -23,7 +24,8 @@ impl PendingSkillExecutions {
         let execution_id = self.next_execution_id;
         let mut ctx = SkillContext::new(compiled, Some(caster), execution_id);
         let result = execute_node(&compiled.plan.root, world, &mut ctx, registry)?;
-        self.pending.extend(result.pending);
+        self.emitted.append(&mut ctx.emitted);
+        self.extend_pending(result.pending);
         Ok(execution_id)
     }
 
@@ -52,7 +54,8 @@ impl PendingSkillExecutions {
         self.pending = still_pending;
         for mut pending in ready {
             let result = execute_node(&pending.node, world, &mut pending.ctx, registry)?;
-            self.pending.extend(result.pending);
+            self.emitted.append(&mut pending.ctx.emitted);
+            self.extend_pending(result.pending);
         }
         Ok(())
     }
@@ -75,7 +78,8 @@ impl PendingSkillExecutions {
         for mut pending in ready {
             pending.ctx.source_event = Some(event.clone());
             let result = execute_node(&pending.node, world, &mut pending.ctx, registry)?;
-            self.pending.extend(result.pending);
+            self.emitted.append(&mut pending.ctx.emitted);
+            self.extend_pending(result.pending);
         }
         Ok(())
     }
@@ -86,6 +90,17 @@ impl PendingSkillExecutions {
 
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
+    }
+
+    pub fn drain_emitted_events(&mut self) -> impl Iterator<Item = SkillRuntimeEvent> + '_ {
+        self.emitted.drain(..)
+    }
+
+    fn extend_pending(&mut self, pending: impl IntoIterator<Item = PendingSkillExecution>) {
+        self.pending.extend(pending.into_iter().map(|mut pending| {
+            pending.ctx.emitted.clear();
+            pending
+        }));
     }
 }
 

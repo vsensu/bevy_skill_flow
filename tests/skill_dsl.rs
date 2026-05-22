@@ -215,6 +215,65 @@ fn execution_sequence_delay_and_on_event_resume() {
 }
 
 #[test]
+fn emitted_events_can_be_drained_after_cast_tick_and_event_resume() {
+    let registry = registry();
+    let skill = parse_skill_def(
+        r#"
+        Skill(
+          id: "emits",
+          body: Sequence([
+            Emit("cast_started", { "skill": "emits" }),
+            Delay(Expr("0.25"), Emit("delay_ready", { "step": 1.0 })),
+            On("impact", Emit("impact_seen", { "target": Expr("event.target") })),
+          ]),
+        )
+    "#,
+    )
+    .unwrap();
+    let compiled = compile_skill(&skill, &registry).unwrap();
+    let mut world = World::new();
+    let caster = world.spawn_empty().id();
+    let mut pending = PendingSkillExecutions::default();
+
+    pending
+        .cast(&compiled, caster, &mut world, &registry)
+        .unwrap();
+    let events = pending.drain_emitted_events().collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].name, "cast_started");
+    assert_eq!(
+        events[0].payload.get("skill"),
+        Some(&SkillValue::String("emits".to_owned()))
+    );
+
+    pending.tick(0.25, &mut world, &registry).unwrap();
+    let events = pending.drain_emitted_events().collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].name, "delay_ready");
+    assert_eq!(
+        events[0].payload.get("step"),
+        Some(&SkillValue::Number(1.0))
+    );
+
+    let mut payload = SkillArgs::new();
+    payload.insert("target".to_owned(), SkillValue::String("dummy".to_owned()));
+    pending
+        .trigger_event(
+            SkillRuntimeEvent::new("impact", payload),
+            &mut world,
+            &registry,
+        )
+        .unwrap();
+    let events = pending.drain_emitted_events().collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].name, "impact_seen");
+    assert_eq!(
+        events[0].payload.get("target"),
+        Some(&SkillValue::String("dummy".to_owned()))
+    );
+}
+
+#[test]
 fn poe_fireball_gmp_compiles_payload_expressions() {
     let mut registry = registry();
     registry.register_skill_modifier(
