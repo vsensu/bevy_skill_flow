@@ -1,0 +1,27 @@
+Skill(
+  id: "arc_trap",
+  tags: ["spell", "trap", "lightning"],
+  params: {
+    "trap_damage": 38.0,
+    "trap_radius": 92.0,
+  },
+  body: Sequence([
+    Emit("skill_cast", { "label": "Arc Trap" }),
+    Action("spawn_zone", {
+      "kind": "trap",
+      "radius": Expr("stat.trap_radius"),
+      "ttl": 5.0,
+      "trigger_event": "trap_triggered",
+    }),
+    On("trap_triggered", Parallel([
+      Action("area_damage", {
+        "x": Expr("event.x"),
+        "y": Expr("event.y"),
+        "radius": Expr("stat.trap_radius"),
+        "amount": Expr("stat.trap_damage"),
+        "kind": "shock",
+      }),
+      Action("combat_log", { "message": "trap triggered" }),
+    ])),
+  ]),
+)

@@ -1,0 +1,30 @@
+Skill(
+  id: "split_fireball",
+  tags: ["spell", "projectile", "fire"],
+  params: {
+    "base_damage": 24.0,
+    "projectile_count": 1.0,
+    "projectile_damage": 1.0,
+    "projectile_spread_degrees": 0.0,
+  },
+  modifiers: ["fan_out"],
+  body: Sequence([
+    Emit("skill_cast", { "label": "Split Fireball" }),
+    Action("spawn_projectile", {
+      "kind": "fire",
+      "count": Expr("stat.projectile_count"),
+      "damage": Expr("stat.base_damage * stat.projectile_damage"),
+      "speed": 540.0,
+      "radius": 18.0,
+      "spread_degrees": Expr("stat.projectile_spread_degrees"),
+      "hit_event": "fireball_hit",
+    }),
+    On("fireball_hit", Action("area_damage", {
+      "x": Expr("event.x"),
+      "y": Expr("event.y"),
+      "radius": 62.0,
+      "amount": 12.0,
+      "kind": "burn",
+    })),
+  ]),
+)

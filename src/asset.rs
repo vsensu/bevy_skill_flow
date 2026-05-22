@@ -51,6 +51,19 @@ impl SkillLibrary {
         self.compiled.insert(skill.id.clone(), skill);
     }
 
+    pub fn remove(&mut self, id: &SkillId) {
+        self.compiled.shift_remove(id);
+        self.invalid.shift_remove(id);
+    }
+
+    pub fn compiled_ids(&self) -> impl Iterator<Item = &SkillId> {
+        self.compiled.keys()
+    }
+
+    pub fn compiled_len(&self) -> usize {
+        self.compiled.len()
+    }
+
     pub fn mark_invalid(&mut self, id: SkillId, err: SkillError) {
         self.compiled.shift_remove(&id);
         self.invalid.insert(id, err);

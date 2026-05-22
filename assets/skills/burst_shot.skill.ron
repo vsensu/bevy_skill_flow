@@ -1,0 +1,26 @@
+Skill(
+  id: "burst_shot",
+  tags: ["spell", "projectile", "physical"],
+  params: {
+    "burst_count": 5.0,
+    "shot_damage": 13.0,
+  },
+  body: Sequence([
+    Emit("skill_cast", { "label": "Burst Shot" }),
+    Repeat(
+      times: Some(Expr("stat.burst_count")),
+      interval: Some(Expr("0.08")),
+      node: Parallel([
+        Action("spawn_projectile", {
+          "kind": "bolt",
+          "count": 1.0,
+          "damage": Expr("stat.shot_damage"),
+          "speed": 700.0,
+          "radius": 10.0,
+          "spread_degrees": 5.0,
+        }),
+        Emit("burst_tick", { "label": "burst projectile" }),
+      ]),
+    ),
+  ]),
+)

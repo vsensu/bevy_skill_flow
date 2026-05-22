@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 bevy = { version = "0.18.1", default-features = false }
+bevy_egui = { version = "0.39.1", optional = true }
 indexmap = { version = "2.7", features = ["serde"] }
 ron = "0.8"
 serde = { version = "1", features = ["derive"] }
@@ -13,8 +14,14 @@ thiserror = "2"
 
 [features]
 demo_2d = ["bevy/2d"]
+editor = ["demo_2d", "dep:bevy_egui"]
 
 [[example]]
 name = "comprehensive_2d"
 path = "examples/comprehensive_2d.rs"
 required-features = ["demo_2d"]
+
+[[example]]
+name = "skill_editor"
+path = "examples/skill_editor.rs"
+required-features = ["editor"]

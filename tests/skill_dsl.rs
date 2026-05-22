@@ -440,3 +440,134 @@ fn compiled_with_stats(stats: Vec<(String, SkillValue)>) -> SkillCompiled {
         plan: SkillPlan::new(SkillNode::Sequence(Vec::new()), stats.into_iter().collect()),
     }
 }
+
+#[cfg(feature = "editor")]
+mod editor_tests {
+    use super::registry;
+    use bevy_skill_dsl::editor::{SkillEditorConfig, SkillEditorState, next_new_skill_path};
+    use bevy_skill_dsl::{SkillId, SkillLibrary};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn editor_scans_skill_files_and_keeps_invalid_file_diagnostics() {
+        let dir = temp_skills_dir("scan");
+        fs::write(
+            dir.join("good.skill.ron"),
+            r#"Skill(id: "good", body: Action("trace", { "label": "ok" }))"#,
+        )
+        .unwrap();
+        fs::write(dir.join("broken.skill.ron"), "Skill(").unwrap();
+        fs::write(dir.join("ignored.ron"), "not a skill").unwrap();
+
+        let config = SkillEditorConfig {
+            skills_dir: dir.clone(),
+            autosave_on_compile_success: false,
+        };
+        let registry = registry();
+        let mut library = SkillLibrary::default();
+        let mut editor = SkillEditorState::default();
+        editor.load_dir(&config, &registry, &mut library).unwrap();
+
+        assert_eq!(editor.files.len(), 2);
+        assert!(library.get(&SkillId::new("good")).is_some());
+        assert!(
+            editor
+                .files
+                .iter()
+                .any(|file| file.path.ends_with("broken.skill.ron") && file.parse_error.is_some())
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn editor_revalidates_dirty_source_without_polluting_last_compiled_skill() {
+        let dir = temp_skills_dir("dirty");
+        let path = dir.join("live.skill.ron");
+        fs::write(
+            &path,
+            r#"Skill(id: "live", body: Action("trace", { "label": "v1" }))"#,
+        )
+        .unwrap();
+
+        let config = SkillEditorConfig {
+            skills_dir: dir.clone(),
+            autosave_on_compile_success: false,
+        };
+        let registry = registry();
+        let mut library = SkillLibrary::default();
+        let mut editor = SkillEditorState::default();
+        editor.load_dir(&config, &registry, &mut library).unwrap();
+        assert!(library.get(&SkillId::new("live")).is_some());
+
+        editor.edit_source(
+            r#"Skill(id: "live", body: Action("missing", {}))"#.to_owned(),
+            &registry,
+            &mut library,
+        );
+
+        assert!(editor.dirty);
+        assert!(editor.diagnostics.compile_error.is_some());
+        assert!(library.get(&SkillId::new("live")).is_some());
+        assert!(editor.compiled_cache.contains_key(&SkillId::new("live")));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn editor_save_rules_keep_paths_and_generate_new_suffixes() {
+        let dir = temp_skills_dir("save");
+        fs::write(dir.join("new_skill.skill.ron"), "").unwrap();
+        assert_eq!(
+            next_new_skill_path(&dir)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("new_skill_2.skill.ron")
+        );
+
+        let path = dir.join("existing.skill.ron");
+        fs::write(
+            &path,
+            r#"Skill(id: "before", body: Action("trace", { "label": "v1" }))"#,
+        )
+        .unwrap();
+        let config = SkillEditorConfig {
+            skills_dir: dir.clone(),
+            autosave_on_compile_success: false,
+        };
+        let registry = registry();
+        let mut library = SkillLibrary::default();
+        let mut editor = SkillEditorState::default();
+        editor.load_dir(&config, &registry, &mut library).unwrap();
+        editor
+            .open_file(path.clone(), &registry, &mut library)
+            .unwrap();
+        editor.edit_source(
+            r#"Skill(id: "after", body: Action("trace", { "label": "v2" }))"#.to_owned(),
+            &registry,
+            &mut library,
+        );
+
+        let saved_path = editor.save_current(&registry).unwrap();
+        assert_eq!(saved_path, path);
+        assert!(!dir.join("after.skill.ron").exists());
+        assert!(fs::read_to_string(path).unwrap().contains(r#"id: "after""#));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn temp_skills_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir()
+            .join("bevy_skill_flow_editor_tests")
+            .join(format!("{label}_{unique}"))
+            .join("skills");
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+}
