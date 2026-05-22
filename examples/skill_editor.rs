@@ -12,10 +12,11 @@ use bevy_skill_dsl::editor::{
     SkillEditorConfig, SkillEditorPlugin, SkillEditorState, is_skill_file,
 };
 use bevy_skill_dsl::{
-    PendingSkillExecutions, SkillAction, SkillArgs, SkillContext, SkillDslPlugin, SkillError,
-    SkillId, SkillLibrary, SkillRegistry, SkillResult, SkillRuntimeEvent, SkillValue, StatModifier,
-    StatOp,
+    PendingSkillExecutions, SkillAction, SkillArgs, SkillContext, SkillDef, SkillDslPlugin,
+    SkillError, SkillExpr, SkillId, SkillLibrary, SkillNode, SkillRegistry, SkillResult,
+    SkillRuntimeEvent, SkillSpecialValue, SkillValue, StatModifier, StatOp,
 };
+use indexmap::IndexSet;
 use std::fs;
 use std::path::Path;
 
@@ -50,6 +51,7 @@ fn main() {
         .init_resource::<CombatLog>()
         .init_resource::<BlastQueue>()
         .init_resource::<EditorCastRequest>()
+        .init_resource::<EditorUiState>()
         .insert_resource(PlayerStats { shield: 0.0 })
         .insert_resource(EnemySpawnTimer(Timer::from_seconds(
             1.2,
@@ -157,6 +159,11 @@ struct BlastQueue {
 
 #[derive(Resource, Default)]
 struct EditorCastRequest(Option<SkillId>);
+
+#[derive(Resource, Default)]
+struct EditorUiState {
+    pending_dirty_action: Option<EditorAction>,
+}
 
 #[derive(Resource, Default)]
 struct SkillBar {
@@ -301,6 +308,7 @@ fn editor_ui(
     mut library: ResMut<SkillLibrary>,
     mut editor: ResMut<SkillEditorState>,
     mut cast_request: ResMut<EditorCastRequest>,
+    mut editor_ui_state: ResMut<EditorUiState>,
     mut skill_bar: ResMut<SkillBar>,
     mut preview_area: ResMut<PreviewArea>,
     pending: Res<PendingSkillExecutions>,
@@ -309,6 +317,8 @@ fn editor_ui(
 ) -> Result {
     let mut action = EditorAction::None;
     let selected = editor.current_file.clone();
+    let mut pending_def_update: Option<SkillDef> = None;
+    let mut pending_source_update: Option<String> = None;
 
     egui::SidePanel::right("skill_inspector")
         .resizable(true)
@@ -317,6 +327,9 @@ fn editor_ui(
             ui.heading("Inspector");
             if let Some(path) = editor.current_file.as_ref() {
                 ui.label(path.display().to_string());
+            }
+            if let Some(err) = editor.last_io_error.as_ref() {
+                ui.colored_label(egui::Color32::from_rgb(238, 112, 92), err);
             }
             ui.separator();
             status_row(ui, "Dirty", if editor.dirty { "yes" } else { "no" });
@@ -431,21 +444,37 @@ fn editor_ui(
                         ui.heading("Skills");
                         ui.horizontal_wrapped(|ui| {
                             if ui.button("New").clicked() {
-                                action = EditorAction::New;
+                                request_editor_action(
+                                    EditorAction::New,
+                                    editor.dirty,
+                                    &mut editor_ui_state,
+                                    &mut action,
+                                );
                             }
                             if ui.button("Save").clicked() {
                                 action = EditorAction::Save;
                             }
                             if ui.button("Reload").clicked() {
-                                action = EditorAction::Reload;
+                                request_editor_action(
+                                    EditorAction::Reload,
+                                    editor.dirty,
+                                    &mut editor_ui_state,
+                                    &mut action,
+                                );
                             }
                             if ui.button("Delete").clicked() {
-                                action = EditorAction::Delete;
+                                request_editor_action(
+                                    EditorAction::Delete,
+                                    editor.dirty,
+                                    &mut editor_ui_state,
+                                    &mut action,
+                                );
                             }
                         });
                         ui.separator();
                         let files_height = (ui.available_height() * 0.23).clamp(96.0, 170.0);
                         egui::ScrollArea::vertical()
+                            .id_salt("skill_file_list_scroll")
                             .max_height(files_height)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
@@ -460,30 +489,48 @@ fn editor_ui(
                                     };
                                     let label = format!("{}  {}", status, file.label());
                                     if ui.selectable_label(is_selected, label).clicked() {
-                                        action = EditorAction::Open(file.path.clone());
+                                        request_editor_action(
+                                            EditorAction::Open(file.path.clone()),
+                                            editor.dirty && !is_selected,
+                                            &mut editor_ui_state,
+                                            &mut action,
+                                        );
                                     }
                                 }
                             });
                         ui.separator();
-                        let mut source = editor.source.clone();
-                        let edit_size =
-                            egui::vec2(ui.available_width(), ui.available_height().max(160.0));
-                        let response = ui.add_sized(
-                            edit_size,
-                            egui::TextEdit::multiline(&mut source)
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY)
-                                .lock_focus(true),
-                        );
-                        if response.changed() {
-                            editor.edit_source(source, &registry, &mut library);
-                            if config.autosave_on_compile_success
-                                && editor.diagnostics.compile_error.is_none()
-                            {
-                                let _ = editor.save_current(&registry);
-                            }
-                            refresh_skill_bar(&mut skill_bar, &editor);
-                        }
+                        egui::ScrollArea::vertical()
+                            .id_salt("skill_structured_editor_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if let Some(mut def) = editor.current_def.clone() {
+                                    if edit_skill_def_ui(ui, &mut def) {
+                                        pending_def_update = Some(def);
+                                    }
+                                } else {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(238, 112, 92),
+                                        "Source must parse before structured editing is available.",
+                                    );
+                                }
+                                ui.separator();
+                                egui::CollapsingHeader::new("Source")
+                                    .id_salt("skill_source_header")
+                                    .show(ui, |ui| {
+                                        let mut source = editor.source.clone();
+                                        let response = ui.add_sized(
+                                            egui::vec2(ui.available_width(), 260.0),
+                                            egui::TextEdit::multiline(&mut source)
+                                                .id_salt("skill_source_editor")
+                                                .font(egui::TextStyle::Monospace)
+                                                .desired_width(f32::INFINITY)
+                                                .lock_focus(true),
+                                        );
+                                        if response.changed() {
+                                            pending_source_update = Some(source);
+                                        }
+                                    });
+                            });
                     });
             });
 
@@ -539,31 +586,64 @@ fn editor_ui(
             }
         });
 
+    if let Some(source) = pending_source_update {
+        editor.edit_source(source, &registry, &mut library);
+        if config.autosave_on_compile_success
+            && editor.diagnostics.parse_error.is_none()
+            && editor.diagnostics.compile_error.is_none()
+        {
+            let _ = editor.save_current_with_library(&registry, &mut library);
+        }
+        refresh_skill_bar(&mut skill_bar, &editor);
+    } else if let Some(def) = pending_def_update {
+        if let Err(err) = editor.edit_def(def, &registry, &mut library) {
+            editor.last_io_error = Some(err.to_string());
+        } else if config.autosave_on_compile_success
+            && editor.diagnostics.parse_error.is_none()
+            && editor.diagnostics.compile_error.is_none()
+        {
+            let _ = editor.save_current_with_library(&registry, &mut library);
+        }
+        refresh_skill_bar(&mut skill_bar, &editor);
+    }
+
+    show_dirty_confirmation(contexts.ctx_mut()?, &mut editor_ui_state, &mut action);
+
     match action {
         EditorAction::None => {}
         EditorAction::Open(path) => {
             if let Err(err) = editor.open_file(path, &registry, &mut library) {
                 editor.last_io_error = Some(err.to_string());
+            } else {
+                editor.last_io_error = None;
             }
         }
         EditorAction::New => {
             if let Err(err) = editor.create_new(&config, &registry, &mut library) {
                 editor.last_io_error = Some(err.to_string());
+            } else {
+                editor.last_io_error = None;
             }
         }
         EditorAction::Save => {
-            if let Err(err) = editor.save_current(&registry) {
+            if let Err(err) = editor.save_current_with_library(&registry, &mut library) {
                 editor.last_io_error = Some(err.to_string());
+            } else {
+                editor.last_io_error = None;
             }
         }
         EditorAction::Reload => {
             if let Err(err) = editor.load_dir(&config, &registry, &mut library) {
                 editor.last_io_error = Some(err.to_string());
+            } else {
+                editor.last_io_error = None;
             }
         }
         EditorAction::Delete => {
             if let Err(err) = editor.delete_current(&config, &registry, &mut library) {
                 editor.last_io_error = Some(err.to_string());
+            } else {
+                editor.last_io_error = None;
             }
         }
     }
@@ -579,6 +659,685 @@ enum EditorAction {
     Save,
     Reload,
     Delete,
+}
+
+fn request_editor_action(
+    requested: EditorAction,
+    dirty: bool,
+    ui_state: &mut EditorUiState,
+    action: &mut EditorAction,
+) {
+    if dirty && requested_discards_source(&requested) {
+        ui_state.pending_dirty_action = Some(requested);
+    } else {
+        *action = requested;
+    }
+}
+
+fn requested_discards_source(action: &EditorAction) -> bool {
+    matches!(
+        action,
+        EditorAction::Open(_) | EditorAction::New | EditorAction::Reload | EditorAction::Delete
+    )
+}
+
+fn show_dirty_confirmation(
+    ctx: &egui::Context,
+    ui_state: &mut EditorUiState,
+    action: &mut EditorAction,
+) {
+    if ui_state.pending_dirty_action.is_none() {
+        return;
+    }
+    egui::Window::new("Unsaved changes")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.label("Discard the current unsaved skill edits?");
+            ui.horizontal(|ui| {
+                if ui.button("Discard").clicked() {
+                    if let Some(pending) = ui_state.pending_dirty_action.take() {
+                        *action = pending;
+                    }
+                }
+                if ui.button("Cancel").clicked() {
+                    ui_state.pending_dirty_action = None;
+                }
+            });
+        });
+}
+
+fn edit_skill_def_ui(ui: &mut egui::Ui, def: &mut SkillDef) -> bool {
+    let mut changed = false;
+    ui.label("Definition");
+    ui.horizontal(|ui| {
+        ui.label("Id");
+        changed |= text_edit_singleline(ui, "skill_def_id", &mut def.id.0);
+    });
+    ui.horizontal(|ui| {
+        ui.label("Cast");
+        changed |= text_edit_singleline(ui, "skill_def_cast_model", &mut def.cast_model);
+    });
+    changed |= edit_string_list(ui, "Tags", &mut def.tags, "tag");
+    changed |= edit_string_list(ui, "Modifiers", &mut def.modifiers, "modifier");
+    changed |= edit_args_map(ui, "Params", &mut def.params, "params");
+    ui.separator();
+    ui.label("Body");
+    changed |= edit_skill_node(ui, &mut def.body, "body");
+    changed
+}
+
+fn edit_string_list(
+    ui: &mut egui::Ui,
+    label: &str,
+    values: &mut Vec<String>,
+    fallback: &str,
+) -> bool {
+    let mut changed = false;
+    egui::CollapsingHeader::new(label)
+        .id_salt(format!("string_list_{label}"))
+        .show(ui, |ui| {
+            let mut remove = None;
+            let mut move_op = None;
+            for index in 0..values.len() {
+                ui.horizontal(|ui| {
+                    ui.label(index.to_string());
+                    changed |= text_edit_singleline(
+                        ui,
+                        format!("{label}_{index}_string"),
+                        &mut values[index],
+                    );
+                    if ui.button("Up").clicked() && index > 0 {
+                        move_op = Some((index, index - 1));
+                    }
+                    if ui.button("Down").clicked() && index + 1 < values.len() {
+                        move_op = Some((index, index + 1));
+                    }
+                    if ui.button("Del").clicked() {
+                        remove = Some(index);
+                    }
+                });
+            }
+            if let Some((from, to)) = move_op {
+                values.swap(from, to);
+                changed = true;
+            }
+            if let Some(index) = remove {
+                values.remove(index);
+                changed = true;
+            }
+            if ui.button(format!("Add {fallback}")).clicked() {
+                values.push(make_unique_name(
+                    fallback,
+                    values.iter().map(String::as_str),
+                ));
+                changed = true;
+            }
+            let original_len = values.len();
+            values.retain(|value| !value.trim().is_empty());
+            changed |= values.len() != original_len;
+        });
+    changed
+}
+
+fn edit_args_map(ui: &mut egui::Ui, label: &str, args: &mut SkillArgs, id: &str) -> bool {
+    let mut changed = false;
+    egui::CollapsingHeader::new(label)
+        .id_salt(format!("{id}_args_header"))
+        .show(ui, |ui| {
+            let mut rows = Vec::new();
+            let mut seen = IndexSet::new();
+            let entries = args
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>();
+
+            for (index, (old_key, old_value)) in entries.into_iter().enumerate() {
+                let mut key = old_key.clone();
+                let mut value = old_value.clone();
+                let mut remove = false;
+                ui.horizontal(|ui| {
+                    ui.label("Key");
+                    changed |= text_edit_singleline(ui, format!("{id}_{index}_key"), &mut key);
+                    if ui.button("Del").clicked() {
+                        remove = true;
+                        changed = true;
+                    }
+                });
+                if key.trim().is_empty() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(238, 112, 92),
+                        "Empty keys are ignored until renamed.",
+                    );
+                    changed = true;
+                    continue;
+                }
+                if !remove {
+                    ui.indent(format!("{id}_{index}_value"), |ui| {
+                        changed |= edit_skill_value(ui, &mut value, &format!("{id}_{index}"));
+                    });
+                    if seen.insert(key.clone()) {
+                        rows.push((key, value));
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(238, 180, 80),
+                            "Duplicate key ignored.",
+                        );
+                        changed = true;
+                    }
+                }
+            }
+
+            if ui.button("Add field").clicked() {
+                rows.push((
+                    make_unique_name("field", args.keys().map(String::as_str)),
+                    SkillValue::Number(0.0),
+                ));
+                changed = true;
+            }
+
+            if changed {
+                args.clear();
+                for (key, value) in rows {
+                    args.insert(key, value);
+                }
+            }
+        });
+    changed
+}
+
+fn edit_skill_value(ui: &mut egui::Ui, value: &mut SkillValue, id: &str) -> bool {
+    let mut changed = false;
+    let mut kind = value_kind(value);
+    ui.horizontal(|ui| {
+        ui.label("Type");
+        egui::ComboBox::from_id_salt(format!("{id}_value_kind"))
+            .selected_text(value_kind_label(kind))
+            .show_ui(ui, |ui| {
+                for candidate in VALUE_KINDS {
+                    ui.selectable_value(&mut kind, candidate, value_kind_label(candidate));
+                }
+            });
+    });
+    if kind != value_kind(value) {
+        *value = default_value(kind);
+        changed = true;
+    }
+
+    match value {
+        SkillValue::Special(SkillSpecialValue::Expr(expr))
+        | SkillValue::Special(SkillSpecialValue::Ref(expr))
+        | SkillValue::Special(SkillSpecialValue::Tag(expr))
+        | SkillValue::Special(SkillSpecialValue::Stat(expr))
+        | SkillValue::String(expr) => {
+            changed |= text_edit_singleline(ui, format!("{id}_value_text"), expr);
+        }
+        SkillValue::Map(map) => {
+            changed |= edit_args_map(ui, "Map", map, &format!("{id}_map"));
+        }
+        SkillValue::List(list) => {
+            changed |= edit_value_list(ui, list, &format!("{id}_list"));
+        }
+        SkillValue::Number(number) => {
+            changed |= ui.add(egui::DragValue::new(number).speed(0.1)).changed();
+        }
+        SkillValue::Bool(flag) => {
+            changed |= ui.checkbox(flag, "Value").changed();
+        }
+        SkillValue::Node(node) => {
+            changed |= edit_skill_node(ui, node, &format!("{id}_node"));
+        }
+        SkillValue::Null => {
+            ui.label("null");
+        }
+    }
+    changed
+}
+
+fn edit_value_list(ui: &mut egui::Ui, values: &mut Vec<SkillValue>, id: &str) -> bool {
+    let mut changed = false;
+    let mut remove = None;
+    let mut move_op = None;
+    for index in 0..values.len() {
+        ui.horizontal(|ui| {
+            ui.label(format!("Item {index}"));
+            if ui.button("Up").clicked() && index > 0 {
+                move_op = Some((index, index - 1));
+            }
+            if ui.button("Down").clicked() && index + 1 < values.len() {
+                move_op = Some((index, index + 1));
+            }
+            if ui.button("Del").clicked() {
+                remove = Some(index);
+            }
+        });
+        ui.indent(format!("{id}_{index}"), |ui| {
+            changed |= edit_skill_value(ui, &mut values[index], &format!("{id}_{index}"));
+        });
+    }
+    if let Some((from, to)) = move_op {
+        values.swap(from, to);
+        changed = true;
+    }
+    if let Some(index) = remove {
+        values.remove(index);
+        changed = true;
+    }
+    if ui.button("Add item").clicked() {
+        values.push(SkillValue::Number(0.0));
+        changed = true;
+    }
+    changed
+}
+
+fn edit_skill_node(ui: &mut egui::Ui, node: &mut SkillNode, id: &str) -> bool {
+    let mut changed = false;
+    let mut kind = node_kind(node);
+    ui.horizontal(|ui| {
+        ui.label("Node");
+        egui::ComboBox::from_id_salt(format!("{id}_node_kind"))
+            .selected_text(node_kind_label(kind))
+            .show_ui(ui, |ui| {
+                for candidate in NODE_KINDS {
+                    ui.selectable_value(&mut kind, candidate, node_kind_label(candidate));
+                }
+            });
+    });
+    if kind != node_kind(node) {
+        *node = default_node(kind);
+        changed = true;
+    }
+
+    match node {
+        SkillNode::Sequence(nodes) => {
+            changed |= edit_node_list(ui, "Sequence", nodes, &format!("{id}_sequence"));
+        }
+        SkillNode::Parallel(nodes) => {
+            changed |= edit_node_list(ui, "Parallel", nodes, &format!("{id}_parallel"));
+        }
+        SkillNode::Delay(expr, child) => {
+            changed |= edit_expr(ui, "Seconds", expr, &format!("{id}_delay_seconds"));
+            ui.indent(format!("{id}_delay_child"), |ui| {
+                changed |= edit_skill_node(ui, child, &format!("{id}_delay_child"));
+            });
+        }
+        SkillNode::Repeat {
+            times,
+            duration,
+            interval,
+            node,
+        } => {
+            changed |= edit_optional_expr(ui, "Times", times, "1", &format!("{id}_repeat_times"));
+            changed |= edit_optional_expr(
+                ui,
+                "Duration",
+                duration,
+                "1.0",
+                &format!("{id}_repeat_duration"),
+            );
+            changed |= edit_optional_expr(
+                ui,
+                "Interval",
+                interval,
+                "0.2",
+                &format!("{id}_repeat_interval"),
+            );
+            ui.indent(format!("{id}_repeat_child"), |ui| {
+                changed |= edit_skill_node(ui, node, &format!("{id}_repeat_child"));
+            });
+        }
+        SkillNode::If {
+            condition,
+            then_node,
+            else_node,
+        } => {
+            changed |= edit_expr(ui, "Condition", condition, &format!("{id}_if_condition"));
+            ui.label("Then");
+            ui.indent(format!("{id}_then"), |ui| {
+                changed |= edit_skill_node(ui, then_node, &format!("{id}_then"));
+            });
+            let mut has_else = else_node.is_some();
+            if ui.checkbox(&mut has_else, "Else").changed() {
+                *else_node = if has_else {
+                    Some(Box::new(default_node(SkillNodeKind::Action)))
+                } else {
+                    None
+                };
+                changed = true;
+            }
+            if let Some(else_child) = else_node {
+                ui.indent(format!("{id}_else"), |ui| {
+                    changed |= edit_skill_node(ui, else_child, &format!("{id}_else"));
+                });
+            }
+        }
+        SkillNode::Let(name, value, child) => {
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                changed |= text_edit_singleline(ui, format!("{id}_let_name"), name);
+            });
+            changed |= edit_skill_value(ui, value, &format!("{id}_let_value"));
+            ui.indent(format!("{id}_let_child"), |ui| {
+                changed |= edit_skill_node(ui, child, &format!("{id}_let_child"));
+            });
+        }
+        SkillNode::On(event, child) => {
+            ui.horizontal(|ui| {
+                ui.label("Event");
+                changed |= text_edit_singleline(ui, format!("{id}_on_event"), event);
+            });
+            ui.indent(format!("{id}_on_child"), |ui| {
+                changed |= edit_skill_node(ui, child, &format!("{id}_on_child"));
+            });
+        }
+        SkillNode::Emit(event, args) => {
+            ui.horizontal(|ui| {
+                ui.label("Event");
+                changed |= text_edit_singleline(ui, format!("{id}_emit_event"), event);
+            });
+            changed |= edit_args_map(ui, "Payload", args, &format!("{id}_emit_args"));
+        }
+        SkillNode::Action(action, args) => {
+            ui.horizontal(|ui| {
+                ui.label("Action");
+                changed |= text_edit_singleline(ui, format!("{id}_action_id"), action);
+            });
+            changed |= edit_args_map(ui, "Args", args, &format!("{id}_action_args"));
+        }
+        SkillNode::Deck(nodes) => {
+            changed |= edit_node_list(ui, "Deck", nodes, &format!("{id}_deck"));
+        }
+        SkillNode::Spell(spell, args) => {
+            ui.horizontal(|ui| {
+                ui.label("Spell");
+                changed |= text_edit_singleline(ui, format!("{id}_spell_id"), spell);
+            });
+            changed |= edit_args_map(ui, "Args", args, &format!("{id}_spell_args"));
+        }
+        SkillNode::Modifier(modifier, args) => {
+            ui.horizontal(|ui| {
+                ui.label("Modifier");
+                changed |= text_edit_singleline(ui, format!("{id}_modifier_id"), modifier);
+            });
+            changed |= edit_args_map(ui, "Args", args, &format!("{id}_modifier_args"));
+        }
+    }
+    changed
+}
+
+fn edit_node_list(ui: &mut egui::Ui, label: &str, nodes: &mut Vec<SkillNode>, id: &str) -> bool {
+    let mut changed = false;
+    ui.label(label);
+    let mut remove = None;
+    let mut move_op = None;
+    for index in 0..nodes.len() {
+        ui.horizontal(|ui| {
+            ui.label(format!("Child {index}"));
+            if ui.button("Up").clicked() && index > 0 {
+                move_op = Some((index, index - 1));
+            }
+            if ui.button("Down").clicked() && index + 1 < nodes.len() {
+                move_op = Some((index, index + 1));
+            }
+            if ui.button("Del").clicked() {
+                remove = Some(index);
+            }
+        });
+        ui.indent(format!("{id}_{index}"), |ui| {
+            changed |= edit_skill_node(ui, &mut nodes[index], &format!("{id}_{index}"));
+        });
+    }
+    if let Some((from, to)) = move_op {
+        nodes.swap(from, to);
+        changed = true;
+    }
+    if let Some(index) = remove {
+        nodes.remove(index);
+        changed = true;
+    }
+    if ui.button("Add child").clicked() {
+        nodes.push(default_node(SkillNodeKind::Action));
+        changed = true;
+    }
+    changed
+}
+
+fn edit_expr(ui: &mut egui::Ui, label: &str, expr: &mut SkillExpr, id: &str) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        changed |= text_edit_singleline(ui, id, &mut expr.0);
+    });
+    changed
+}
+
+fn edit_optional_expr(
+    ui: &mut egui::Ui,
+    label: &str,
+    expr: &mut Option<SkillExpr>,
+    fallback: &str,
+    id: &str,
+) -> bool {
+    let mut changed = false;
+    let mut enabled = expr.is_some();
+    if ui.checkbox(&mut enabled, label).changed() {
+        *expr = if enabled {
+            Some(SkillExpr::new(fallback))
+        } else {
+            None
+        };
+        changed = true;
+    }
+    if let Some(expr) = expr {
+        changed |= edit_expr(ui, "Expr", expr, &format!("{id}_expr"));
+    }
+    changed
+}
+
+fn text_edit_singleline(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    value: &mut String,
+) -> bool {
+    ui.add(
+        egui::TextEdit::singleline(value)
+            .id_salt(id_salt)
+            .desired_width(f32::INFINITY),
+    )
+    .changed()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SkillNodeKind {
+    Sequence,
+    Parallel,
+    Delay,
+    Repeat,
+    If,
+    Let,
+    On,
+    Emit,
+    Action,
+    Deck,
+    Spell,
+    Modifier,
+}
+
+const NODE_KINDS: [SkillNodeKind; 12] = [
+    SkillNodeKind::Sequence,
+    SkillNodeKind::Parallel,
+    SkillNodeKind::Delay,
+    SkillNodeKind::Repeat,
+    SkillNodeKind::If,
+    SkillNodeKind::Let,
+    SkillNodeKind::On,
+    SkillNodeKind::Emit,
+    SkillNodeKind::Action,
+    SkillNodeKind::Deck,
+    SkillNodeKind::Spell,
+    SkillNodeKind::Modifier,
+];
+
+fn node_kind(node: &SkillNode) -> SkillNodeKind {
+    match node {
+        SkillNode::Sequence(_) => SkillNodeKind::Sequence,
+        SkillNode::Parallel(_) => SkillNodeKind::Parallel,
+        SkillNode::Delay(_, _) => SkillNodeKind::Delay,
+        SkillNode::Repeat { .. } => SkillNodeKind::Repeat,
+        SkillNode::If { .. } => SkillNodeKind::If,
+        SkillNode::Let(_, _, _) => SkillNodeKind::Let,
+        SkillNode::On(_, _) => SkillNodeKind::On,
+        SkillNode::Emit(_, _) => SkillNodeKind::Emit,
+        SkillNode::Action(_, _) => SkillNodeKind::Action,
+        SkillNode::Deck(_) => SkillNodeKind::Deck,
+        SkillNode::Spell(_, _) => SkillNodeKind::Spell,
+        SkillNode::Modifier(_, _) => SkillNodeKind::Modifier,
+    }
+}
+
+fn node_kind_label(kind: SkillNodeKind) -> &'static str {
+    match kind {
+        SkillNodeKind::Sequence => "Sequence",
+        SkillNodeKind::Parallel => "Parallel",
+        SkillNodeKind::Delay => "Delay",
+        SkillNodeKind::Repeat => "Repeat",
+        SkillNodeKind::If => "If",
+        SkillNodeKind::Let => "Let",
+        SkillNodeKind::On => "On",
+        SkillNodeKind::Emit => "Emit",
+        SkillNodeKind::Action => "Action",
+        SkillNodeKind::Deck => "Deck",
+        SkillNodeKind::Spell => "Spell",
+        SkillNodeKind::Modifier => "Modifier",
+    }
+}
+
+fn default_node(kind: SkillNodeKind) -> SkillNode {
+    match kind {
+        SkillNodeKind::Sequence => SkillNode::Sequence(vec![default_node(SkillNodeKind::Action)]),
+        SkillNodeKind::Parallel => SkillNode::Parallel(vec![default_node(SkillNodeKind::Action)]),
+        SkillNodeKind::Delay => SkillNode::Delay(
+            SkillExpr::new("0.25"),
+            Box::new(default_node(SkillNodeKind::Action)),
+        ),
+        SkillNodeKind::Repeat => SkillNode::Repeat {
+            times: Some(SkillExpr::new("3")),
+            duration: None,
+            interval: Some(SkillExpr::new("0.2")),
+            node: Box::new(default_node(SkillNodeKind::Action)),
+        },
+        SkillNodeKind::If => SkillNode::If {
+            condition: SkillExpr::new("true"),
+            then_node: Box::new(default_node(SkillNodeKind::Action)),
+            else_node: None,
+        },
+        SkillNodeKind::Let => SkillNode::Let(
+            "value".to_owned(),
+            SkillValue::Number(0.0),
+            Box::new(default_node(SkillNodeKind::Action)),
+        ),
+        SkillNodeKind::On => SkillNode::On(
+            "hit".to_owned(),
+            Box::new(default_node(SkillNodeKind::Action)),
+        ),
+        SkillNodeKind::Emit => SkillNode::Emit("skill_event".to_owned(), SkillArgs::new()),
+        SkillNodeKind::Action => SkillNode::Action("trace".to_owned(), SkillArgs::new()),
+        SkillNodeKind::Deck => SkillNode::Deck(vec![default_node(SkillNodeKind::Spell)]),
+        SkillNodeKind::Spell => SkillNode::Spell("spell".to_owned(), SkillArgs::new()),
+        SkillNodeKind::Modifier => SkillNode::Modifier("modifier".to_owned(), SkillArgs::new()),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SkillValueKind {
+    Number,
+    Bool,
+    String,
+    Null,
+    Expr,
+    Ref,
+    Tag,
+    Stat,
+    Map,
+    List,
+    Node,
+}
+
+const VALUE_KINDS: [SkillValueKind; 11] = [
+    SkillValueKind::Number,
+    SkillValueKind::Bool,
+    SkillValueKind::String,
+    SkillValueKind::Null,
+    SkillValueKind::Expr,
+    SkillValueKind::Ref,
+    SkillValueKind::Tag,
+    SkillValueKind::Stat,
+    SkillValueKind::Map,
+    SkillValueKind::List,
+    SkillValueKind::Node,
+];
+
+fn value_kind(value: &SkillValue) -> SkillValueKind {
+    match value {
+        SkillValue::Special(SkillSpecialValue::Expr(_)) => SkillValueKind::Expr,
+        SkillValue::Special(SkillSpecialValue::Ref(_)) => SkillValueKind::Ref,
+        SkillValue::Special(SkillSpecialValue::Tag(_)) => SkillValueKind::Tag,
+        SkillValue::Special(SkillSpecialValue::Stat(_)) => SkillValueKind::Stat,
+        SkillValue::Map(_) => SkillValueKind::Map,
+        SkillValue::List(_) => SkillValueKind::List,
+        SkillValue::Number(_) => SkillValueKind::Number,
+        SkillValue::Bool(_) => SkillValueKind::Bool,
+        SkillValue::String(_) => SkillValueKind::String,
+        SkillValue::Node(_) => SkillValueKind::Node,
+        SkillValue::Null => SkillValueKind::Null,
+    }
+}
+
+fn value_kind_label(kind: SkillValueKind) -> &'static str {
+    match kind {
+        SkillValueKind::Number => "Number",
+        SkillValueKind::Bool => "Bool",
+        SkillValueKind::String => "String",
+        SkillValueKind::Null => "Null",
+        SkillValueKind::Expr => "Expr",
+        SkillValueKind::Ref => "Ref",
+        SkillValueKind::Tag => "Tag",
+        SkillValueKind::Stat => "Stat",
+        SkillValueKind::Map => "Map",
+        SkillValueKind::List => "List",
+        SkillValueKind::Node => "Node",
+    }
+}
+
+fn default_value(kind: SkillValueKind) -> SkillValue {
+    match kind {
+        SkillValueKind::Number => SkillValue::Number(0.0),
+        SkillValueKind::Bool => SkillValue::Bool(false),
+        SkillValueKind::String => SkillValue::String(String::new()),
+        SkillValueKind::Null => SkillValue::Null,
+        SkillValueKind::Expr => SkillValue::Special(SkillSpecialValue::Expr("stat.damage".into())),
+        SkillValueKind::Ref => SkillValue::Special(SkillSpecialValue::Ref("target".into())),
+        SkillValueKind::Tag => SkillValue::Special(SkillSpecialValue::Tag("spell".into())),
+        SkillValueKind::Stat => SkillValue::Special(SkillSpecialValue::Stat("damage".into())),
+        SkillValueKind::Map => SkillValue::Map(SkillArgs::new()),
+        SkillValueKind::List => SkillValue::List(Vec::new()),
+        SkillValueKind::Node => SkillValue::Node(Box::new(default_node(SkillNodeKind::Action))),
+    }
+}
+
+fn make_unique_name<'a>(prefix: &str, existing: impl IntoIterator<Item = &'a str>) -> String {
+    let existing = existing.into_iter().collect::<IndexSet<_>>();
+    if !existing.contains(prefix) {
+        return prefix.to_owned();
+    }
+    for index in 2.. {
+        let candidate = format!("{prefix}_{index}");
+        if !existing.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded suffix search should always find a free name")
 }
 
 fn status_row(ui: &mut egui::Ui, label: &str, value: &str) {

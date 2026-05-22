@@ -4,6 +4,7 @@ use crate::dsl::{SkillCompiled, SkillDef, SkillId};
 use crate::registry::{SkillError, SkillRegistry};
 use bevy::prelude::{App, Plugin, Resource};
 use indexmap::IndexMap;
+use ron::ser::PrettyConfig;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -132,6 +133,17 @@ impl SkillEditorState {
         self.revalidate(registry, library);
     }
 
+    pub fn edit_def(
+        &mut self,
+        def: SkillDef,
+        registry: &SkillRegistry,
+        library: &mut SkillLibrary,
+    ) -> Result<(), SkillEditorError> {
+        let source = serialize_skill_def(&def)?;
+        self.edit_source(source, registry, library);
+        Ok(())
+    }
+
     pub fn revalidate(&mut self, registry: &SkillRegistry, library: &mut SkillLibrary) {
         let previous_id = self.current_def.as_ref().map(|def| def.id.clone());
         let result = validate_source(&self.source, registry);
@@ -173,6 +185,23 @@ impl SkillEditorState {
         fs::write(&path, &self.source)?;
         self.dirty = false;
         self.diagnostics = validate_source(&self.source, registry).into_diagnostics();
+        self.update_current_file_diagnostics();
+        Ok(path)
+    }
+
+    pub fn save_current_with_library(
+        &mut self,
+        registry: &SkillRegistry,
+        library: &mut SkillLibrary,
+    ) -> Result<PathBuf, SkillEditorError> {
+        parse_skill_def(&self.source)?;
+        let Some(path) = self.current_file.clone() else {
+            return Err(SkillEditorError::NoCurrentFile);
+        };
+        fs::write(&path, &self.source)?;
+        self.dirty = false;
+        self.revalidate(registry, library);
+        self.update_current_file_diagnostics();
         Ok(path)
     }
 
@@ -237,6 +266,17 @@ impl SkillEditorState {
         self.selected_compiled().is_some()
             && (self.diagnostics.parse_error.is_some() || self.diagnostics.compile_error.is_some())
     }
+
+    fn update_current_file_diagnostics(&mut self) {
+        let Some(path) = self.current_file.as_ref() else {
+            return;
+        };
+        if let Some(file) = self.files.iter_mut().find(|file| &file.path == path) {
+            file.skill_id = self.diagnostics.skill_id.clone();
+            file.parse_error = self.diagnostics.parse_error.clone();
+            file.compile_error = self.diagnostics.compile_error.clone();
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -296,6 +336,8 @@ impl ValidationResult {
 pub enum SkillEditorError {
     #[error("{0}")]
     Skill(#[from] SkillError),
+    #[error("{0}")]
+    RonSerialize(#[from] ron::Error),
     #[error("{0}")]
     Io(#[from] io::Error),
     #[error("no skill file is selected")]
@@ -366,6 +408,18 @@ fn validate_source(source: &str, registry: &SkillRegistry) -> ValidationResult {
             compile_error: None,
         },
     }
+}
+
+pub fn serialize_skill_def(def: &SkillDef) -> Result<String, ron::Error> {
+    let mut source = ron::ser::to_string_pretty(
+        def,
+        PrettyConfig::default()
+            .struct_names(true)
+            .new_line("\n".to_owned())
+            .indentor("  ".to_owned()),
+    )?;
+    source.push('\n');
+    Ok(source)
 }
 
 pub const DEFAULT_SKILL_TEMPLATE: &str = r#"Skill(

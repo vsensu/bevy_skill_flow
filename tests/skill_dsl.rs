@@ -444,8 +444,13 @@ fn compiled_with_stats(stats: Vec<(String, SkillValue)>) -> SkillCompiled {
 #[cfg(feature = "editor")]
 mod editor_tests {
     use super::registry;
-    use bevy_skill_dsl::editor::{SkillEditorConfig, SkillEditorState, next_new_skill_path};
-    use bevy_skill_dsl::{SkillId, SkillLibrary};
+    use bevy_skill_dsl::editor::{
+        SkillEditorConfig, SkillEditorState, next_new_skill_path, serialize_skill_def,
+    };
+    use bevy_skill_dsl::{
+        SkillArgs, SkillDef, SkillExpr, SkillId, SkillLibrary, SkillNode, SkillValue,
+        parse_skill_def,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -565,6 +570,100 @@ mod editor_tests {
         assert!(fs::read_to_string(path).unwrap().contains(r#"id: "after""#));
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn editor_structured_edit_updates_source_diagnostics_and_preview() {
+        let dir = temp_skills_dir("structured");
+        let path = dir.join("live.skill.ron");
+        fs::write(
+            &path,
+            r#"Skill(id: "live", tags: ["spell"], body: Action("trace", { "label": "v1" }))"#,
+        )
+        .unwrap();
+        let config = SkillEditorConfig {
+            skills_dir: dir.clone(),
+            autosave_on_compile_success: false,
+        };
+        let registry = registry();
+        let mut library = SkillLibrary::default();
+        let mut editor = SkillEditorState::default();
+        editor.load_dir(&config, &registry, &mut library).unwrap();
+
+        let mut def = editor.current_def.clone().unwrap();
+        def.id = SkillId::new("edited");
+        def.tags.push("projectile".to_owned());
+        def.params
+            .insert("damage".to_owned(), SkillValue::Number(42.0));
+        editor.edit_def(def, &registry, &mut library).unwrap();
+
+        assert!(editor.dirty);
+        assert_eq!(editor.diagnostics.skill_id, Some(SkillId::new("edited")));
+        assert!(editor.source.contains(r#"id: "edited""#));
+        assert!(editor.source.contains(r#""damage": 42.0"#));
+        assert!(library.get(&SkillId::new("edited")).is_some());
+        assert_eq!(
+            editor.selected_preview_skill_id(),
+            Some(SkillId::new("edited"))
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn editor_structured_save_round_trips_pretty_ron_to_disk() {
+        let dir = temp_skills_dir("structured_save");
+        let path = dir.join("live.skill.ron");
+        fs::write(
+            &path,
+            r#"Skill(id: "live", body: Action("trace", { "label": "v1" }))"#,
+        )
+        .unwrap();
+        let config = SkillEditorConfig {
+            skills_dir: dir.clone(),
+            autosave_on_compile_success: false,
+        };
+        let registry = registry();
+        let mut library = SkillLibrary::default();
+        let mut editor = SkillEditorState::default();
+        editor.load_dir(&config, &registry, &mut library).unwrap();
+
+        let mut def = editor.current_def.clone().unwrap();
+        let mut first_args = SkillArgs::new();
+        first_args.insert("label".to_owned(), SkillValue::String("a".to_owned()));
+        let mut delayed_args = SkillArgs::new();
+        delayed_args.insert("label".to_owned(), SkillValue::String("b".to_owned()));
+        def.body = SkillNode::Sequence(vec![
+            SkillNode::Action("trace".to_owned(), first_args),
+            SkillNode::Delay(
+                SkillExpr::new("0.25"),
+                Box::new(SkillNode::Action("trace".to_owned(), delayed_args)),
+            ),
+        ]);
+        editor.edit_def(def, &registry, &mut library).unwrap();
+        editor
+            .save_current_with_library(&registry, &mut library)
+            .unwrap();
+
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.starts_with("Skill(\n"));
+        assert!(parse_skill_def(&saved).is_ok());
+        assert!(!editor.dirty);
+        assert!(editor.files.iter().any(|file| file.path == path
+            && file.parse_error.is_none()
+            && file.compile_error.is_none()));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn serialize_skill_def_outputs_named_skill_ron() {
+        let def: SkillDef =
+            parse_skill_def(r#"Skill(id: "pretty", body: Action("trace", {}))"#).unwrap();
+        let source = serialize_skill_def(&def).unwrap();
+        assert!(source.starts_with("Skill(\n"));
+        assert!(source.ends_with('\n'));
+        assert_eq!(parse_skill_def(&source).unwrap().id, SkillId::new("pretty"));
     }
 
     fn temp_skills_dir(label: &str) -> PathBuf {
