@@ -501,6 +501,10 @@ mod editor_tests {
         let mut editor = SkillEditorState::default();
         editor.load_dir(&config, &registry, &mut library).unwrap();
         assert!(library.get(&SkillId::new("live")).is_some());
+        assert_eq!(
+            editor.selected_preview_skill_id(),
+            Some(SkillId::new("live"))
+        );
 
         editor.edit_source(
             r#"Skill(id: "live", body: Action("missing", {}))"#.to_owned(),
@@ -512,6 +516,11 @@ mod editor_tests {
         assert!(editor.diagnostics.compile_error.is_some());
         assert!(library.get(&SkillId::new("live")).is_some());
         assert!(editor.compiled_cache.contains_key(&SkillId::new("live")));
+        assert_eq!(
+            editor.selected_preview_skill_id(),
+            Some(SkillId::new("live"))
+        );
+        assert!(editor.preview_is_stale());
 
         fs::remove_dir_all(dir).unwrap();
     }

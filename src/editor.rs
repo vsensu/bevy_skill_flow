@@ -50,6 +50,7 @@ pub struct SkillEditorState {
     pub dirty: bool,
     pub diagnostics: EditorDiagnostics,
     pub current_def: Option<SkillDef>,
+    pub preview_skill_id: Option<SkillId>,
     pub compiled_cache: IndexMap<SkillId, SkillCompiled>,
     pub last_io_error: Option<String>,
 }
@@ -95,6 +96,7 @@ impl SkillEditorState {
             self.source.clear();
             self.dirty = false;
             self.current_def = None;
+            self.preview_skill_id = None;
             self.diagnostics = EditorDiagnostics::default();
         }
 
@@ -111,6 +113,7 @@ impl SkillEditorState {
         self.current_file = Some(path);
         self.source = source;
         self.dirty = false;
+        self.preview_skill_id = None;
         self.revalidate(registry, library);
         Ok(())
     }
@@ -142,15 +145,22 @@ impl SkillEditorState {
         {
             library.remove(&id);
             self.compiled_cache.shift_remove(&id);
+            if self.preview_skill_id.as_ref() == Some(&id) {
+                self.preview_skill_id = None;
+            }
         }
 
         if let Some(compiled) = result.compiled {
             library.insert_compiled(compiled.clone());
+            self.preview_skill_id = Some(compiled.id.clone());
             self.compiled_cache.insert(compiled.id.clone(), compiled);
         } else if let (Some(id), Some(err)) =
             (self.diagnostics.skill_id.clone(), result.compile_error)
             && !self.compiled_cache.contains_key(&id)
         {
+            if self.preview_skill_id.as_ref() == Some(&id) {
+                self.preview_skill_id = None;
+            }
             library.mark_invalid(id, err);
         }
     }
@@ -194,6 +204,9 @@ impl SkillEditorState {
         if let Some(id) = self.current_def.as_ref().map(|def| def.id.clone()) {
             library.remove(&id);
             self.compiled_cache.shift_remove(&id);
+            if self.preview_skill_id.as_ref() == Some(&id) {
+                self.preview_skill_id = None;
+            }
         }
         if path.exists() {
             fs::remove_file(&path)?;
@@ -207,8 +220,22 @@ impl SkillEditorState {
     }
 
     pub fn selected_compiled(&self) -> Option<&SkillCompiled> {
-        self.selected_skill_id()
-            .and_then(|id| self.compiled_cache.get(&id))
+        self.preview_skill_id
+            .as_ref()
+            .and_then(|id| self.compiled_cache.get(id))
+            .or_else(|| {
+                self.selected_skill_id()
+                    .and_then(|id| self.compiled_cache.get(&id))
+            })
+    }
+
+    pub fn selected_preview_skill_id(&self) -> Option<SkillId> {
+        self.selected_compiled().map(|compiled| compiled.id.clone())
+    }
+
+    pub fn preview_is_stale(&self) -> bool {
+        self.selected_compiled().is_some()
+            && (self.diagnostics.parse_error.is_some() || self.diagnostics.compile_error.is_some())
     }
 }
 

@@ -1,6 +1,13 @@
+use bevy::camera::{RenderTarget, ScalingMode, visibility::RenderLayers};
 use bevy::prelude::*;
+use bevy::render::render_resource::{
+    Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
+};
 use bevy::window::WindowResolution;
-use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
+use bevy_egui::{
+    EguiContexts, EguiGlobalSettings, EguiPlugin, EguiPrimaryContextPass, EguiTextureHandle,
+    EguiUserTextures, PrimaryEguiContext, egui,
+};
 use bevy_skill_dsl::editor::{
     SkillEditorConfig, SkillEditorPlugin, SkillEditorState, is_skill_file,
 };
@@ -13,6 +20,12 @@ use std::fs;
 use std::path::Path;
 
 const ARENA_HALF: Vec2 = Vec2::new(430.0, 280.0);
+const PREVIEW_WORLD_SIZE: Vec2 = Vec2::new(980.0, 680.0);
+const PREVIEW_TEXTURE_SIZE: Extent3d = Extent3d {
+    width: 980,
+    height: 680,
+    depth_or_array_layers: 1,
+};
 const PLAYER_SPEED: f32 = 280.0;
 const ENEMY_SPEED: f32 = 70.0;
 const MAX_ENEMIES: usize = 10;
@@ -33,6 +46,7 @@ fn main() {
             SkillEditorPlugin::new(SkillEditorConfig::default()),
         ))
         .init_resource::<AimWorld>()
+        .init_resource::<PreviewArea>()
         .init_resource::<CombatLog>()
         .init_resource::<BlastQueue>()
         .init_resource::<EditorCastRequest>()
@@ -101,8 +115,19 @@ struct Lifetime {
 #[derive(Component)]
 struct HudText;
 
+#[derive(Component)]
+struct PreviewCamera;
+
+#[derive(Resource, Deref)]
+struct PreviewImage(Handle<Image>);
+
 #[derive(Resource, Default)]
 struct AimWorld(Vec2);
+
+#[derive(Resource, Default)]
+struct PreviewArea {
+    logical_rect: Option<Rect>,
+}
 
 #[derive(Resource)]
 struct CastIntent {
@@ -145,8 +170,61 @@ struct SkillSlot {
     key: KeyCode,
 }
 
-fn setup_scene(mut commands: Commands) {
-    commands.spawn(Camera2d);
+fn setup_scene(
+    mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
+    mut egui_user_textures: ResMut<EguiUserTextures>,
+    mut egui_global_settings: ResMut<EguiGlobalSettings>,
+) {
+    egui_global_settings.auto_create_primary_context = false;
+
+    let mut preview_image = Image {
+        texture_descriptor: TextureDescriptor {
+            label: Some("skill_editor_preview"),
+            size: PREVIEW_TEXTURE_SIZE,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Bgra8UnormSrgb,
+            mip_level_count: 1,
+            sample_count: 1,
+            usage: TextureUsages::TEXTURE_BINDING
+                | TextureUsages::COPY_DST
+                | TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        },
+        ..default()
+    };
+    preview_image.resize(PREVIEW_TEXTURE_SIZE);
+    let preview_image = images.add(preview_image);
+    egui_user_textures.add_image(EguiTextureHandle::Strong(preview_image.clone()));
+    commands.insert_resource(PreviewImage(preview_image.clone()));
+
+    commands.spawn((
+        Camera2d,
+        Camera {
+            order: -1,
+            clear_color: ClearColorConfig::Custom(Color::srgb(0.10, 0.12, 0.13)),
+            ..default()
+        },
+        Projection::Orthographic(OrthographicProjection {
+            scaling_mode: ScalingMode::Fixed {
+                width: PREVIEW_WORLD_SIZE.x,
+                height: PREVIEW_WORLD_SIZE.y,
+            },
+            ..OrthographicProjection::default_2d()
+        }),
+        RenderTarget::Image(preview_image.into()),
+        PreviewCamera,
+    ));
+    commands.spawn((
+        PrimaryEguiContext,
+        Camera2d,
+        Camera {
+            order: 10,
+            clear_color: ClearColorConfig::Custom(Color::srgb(0.08, 0.085, 0.09)),
+            ..default()
+        },
+        RenderLayers::layer(31),
+    ));
     commands.spawn((
         Sprite::from_color(Color::srgb(0.14, 0.17, 0.18), ARENA_HALF * 2.0),
         Transform::from_xyz(0.0, 0.0, -5.0),
@@ -224,49 +302,13 @@ fn editor_ui(
     mut editor: ResMut<SkillEditorState>,
     mut cast_request: ResMut<EditorCastRequest>,
     mut skill_bar: ResMut<SkillBar>,
+    mut preview_area: ResMut<PreviewArea>,
     pending: Res<PendingSkillExecutions>,
     log: Res<CombatLog>,
+    preview_image: Res<PreviewImage>,
 ) -> Result {
     let mut action = EditorAction::None;
     let selected = editor.current_file.clone();
-
-    egui::SidePanel::left("skill_files")
-        .resizable(true)
-        .default_width(220.0)
-        .show(contexts.ctx_mut()?, |ui| {
-            ui.heading("Skills");
-            ui.horizontal(|ui| {
-                if ui.button("New").clicked() {
-                    action = EditorAction::New;
-                }
-                if ui.button("Save").clicked() {
-                    action = EditorAction::Save;
-                }
-                if ui.button("Reload").clicked() {
-                    action = EditorAction::Reload;
-                }
-            });
-            if ui.button("Delete").clicked() {
-                action = EditorAction::Delete;
-            }
-            ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for file in &editor.files {
-                    let is_selected = Some(&file.path) == selected.as_ref();
-                    let status = if file.parse_error.is_some() {
-                        "parse"
-                    } else if file.compile_error.is_some() {
-                        "compile"
-                    } else {
-                        "ok"
-                    };
-                    let label = format!("{}  {}", status, file.label());
-                    if ui.selectable_label(is_selected, label).clicked() {
-                        action = EditorAction::Open(file.path.clone());
-                    }
-                }
-            });
-        });
 
     egui::SidePanel::right("skill_inspector")
         .resizable(true)
@@ -291,6 +333,14 @@ fn editor_ui(
             } else {
                 ui.colored_label(egui::Color32::from_rgb(124, 207, 154), "parse + compile ok");
             }
+            if editor.preview_is_stale()
+                && let Some(id) = editor.selected_preview_skill_id()
+            {
+                ui.colored_label(
+                    egui::Color32::from_rgb(238, 180, 80),
+                    format!("Previewing last compiled `{id}`"),
+                );
+            }
             ui.separator();
             if let Some(compiled) = editor.selected_compiled() {
                 ui.label("Stats");
@@ -302,6 +352,11 @@ fn editor_ui(
             status_row(ui, "Compiled", &library.compiled_len().to_string());
             status_row(ui, "Pending", &pending.len().to_string());
             ui.separator();
+            ui.label("Log");
+            for line in log.lines.iter().rev().take(6) {
+                ui.monospace(line);
+            }
+            ui.separator();
             ui.label("Events");
             for event in log.recent_events.iter().rev().take(8) {
                 ui.monospace(event);
@@ -312,10 +367,24 @@ fn editor_ui(
         .resizable(false)
         .show(contexts.ctx_mut()?, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Cast Selected").clicked()
-                    && let Some(id) = editor.selected_skill_id()
+                let cast_enabled = editor.selected_compiled().is_some();
+                let cast_response =
+                    ui.add_enabled(cast_enabled, egui::Button::new("Cast Selected"));
+                if cast_response.clicked()
+                    && let Some(id) = editor.selected_preview_skill_id()
                 {
                     cast_request.0 = Some(id);
+                }
+                if !cast_enabled {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(238, 112, 92),
+                        cast_disabled_reason(&editor),
+                    );
+                } else if editor.preview_is_stale() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(238, 180, 80),
+                        "current source failed; casting last compiled",
+                    );
                 }
                 for (index, slot) in skill_bar.slots.iter().enumerate() {
                     let state = if slot.remaining > 0.0 {
@@ -328,22 +397,147 @@ fn editor_ui(
             });
         });
 
-    egui::CentralPanel::default().show(contexts.ctx_mut()?, |ui| {
-        let mut source = editor.source.clone();
-        let response = egui::TextEdit::multiline(&mut source)
-            .font(egui::TextStyle::Monospace)
-            .desired_width(f32::INFINITY)
-            .desired_rows(28)
-            .lock_focus(true)
-            .show(ui);
-        if response.response.changed() {
-            editor.edit_source(source, &registry, &mut library);
-            if config.autosave_on_compile_success && editor.diagnostics.compile_error.is_none() {
-                let _ = editor.save_current(&registry);
+    preview_area.logical_rect = None;
+    let preview_texture_id = contexts.image_id(&**preview_image);
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE)
+        .show(contexts.ctx_mut()?, |ui| {
+            let available = ui.available_rect_before_wrap();
+            let gap = 10.0;
+            let editor_width = if available.width() >= 760.0 {
+                (available.width() * 0.32)
+                    .clamp(340.0, 460.0)
+                    .min(available.width() - gap - 360.0)
+            } else {
+                (available.width() * 0.42).clamp(280.0, 340.0)
+            };
+            let editor_rect = egui::Rect::from_min_size(
+                available.min,
+                egui::vec2(editor_width, available.height()),
+            );
+            let preview_bounds = egui::Rect::from_min_max(
+                egui::pos2(editor_rect.max.x + gap, available.min.y),
+                available.max,
+            );
+            let preview_rect =
+                fit_rect_to_aspect(preview_bounds, PREVIEW_WORLD_SIZE.x / PREVIEW_WORLD_SIZE.y);
+
+            ui.scope_builder(egui::UiBuilder::new().max_rect(editor_rect), |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(29, 32, 34))
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.set_min_size(editor_rect.shrink(8.0).size());
+                        ui.heading("Skills");
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("New").clicked() {
+                                action = EditorAction::New;
+                            }
+                            if ui.button("Save").clicked() {
+                                action = EditorAction::Save;
+                            }
+                            if ui.button("Reload").clicked() {
+                                action = EditorAction::Reload;
+                            }
+                            if ui.button("Delete").clicked() {
+                                action = EditorAction::Delete;
+                            }
+                        });
+                        ui.separator();
+                        let files_height = (ui.available_height() * 0.23).clamp(96.0, 170.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(files_height)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for file in &editor.files {
+                                    let is_selected = Some(&file.path) == selected.as_ref();
+                                    let status = if file.parse_error.is_some() {
+                                        "parse"
+                                    } else if file.compile_error.is_some() {
+                                        "compile"
+                                    } else {
+                                        "ok"
+                                    };
+                                    let label = format!("{}  {}", status, file.label());
+                                    if ui.selectable_label(is_selected, label).clicked() {
+                                        action = EditorAction::Open(file.path.clone());
+                                    }
+                                }
+                            });
+                        ui.separator();
+                        let mut source = editor.source.clone();
+                        let edit_size =
+                            egui::vec2(ui.available_width(), ui.available_height().max(160.0));
+                        let response = ui.add_sized(
+                            edit_size,
+                            egui::TextEdit::multiline(&mut source)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                                .lock_focus(true),
+                        );
+                        if response.changed() {
+                            editor.edit_source(source, &registry, &mut library);
+                            if config.autosave_on_compile_success
+                                && editor.diagnostics.compile_error.is_none()
+                            {
+                                let _ = editor.save_current(&registry);
+                            }
+                            refresh_skill_bar(&mut skill_bar, &editor);
+                        }
+                    });
+            });
+
+            let response = if let Some(texture_id) = preview_texture_id {
+                ui.put(
+                    preview_rect,
+                    egui::Image::new(egui::load::SizedTexture::new(
+                        texture_id,
+                        preview_rect.size(),
+                    ))
+                    .sense(egui::Sense::hover()),
+                )
+            } else {
+                ui.allocate_rect(preview_rect, egui::Sense::hover())
+            };
+            let rect = response.rect;
+            preview_area.logical_rect = Some(Rect {
+                min: Vec2::new(rect.min.x, rect.min.y),
+                max: Vec2::new(rect.max.x, rect.max.y),
+            });
+            ui.painter().rect_stroke(
+                rect,
+                6,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(78, 92, 96)),
+                egui::StrokeKind::Inside,
+            );
+            egui::Area::new("preview_label".into())
+                .fixed_pos(rect.min + egui::vec2(10.0, 10.0))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_black_alpha(150))
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin::symmetric(8, 4))
+                        .show(ui, |ui| {
+                            ui.label("Preview");
+                        });
+                });
+            if editor.selected_compiled().is_none() {
+                egui::Area::new("preview_error".into())
+                    .fixed_pos(rect.center() - egui::vec2(130.0, 20.0))
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_black_alpha(180))
+                            .corner_radius(6)
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .show(ui, |ui| {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(238, 112, 92),
+                                    cast_disabled_reason(&editor),
+                                );
+                            });
+                    });
             }
-            refresh_skill_bar(&mut skill_bar, &editor);
-        }
-    });
+        });
 
     match action {
         EditorAction::None => {}
@@ -394,6 +588,28 @@ fn status_row(ui: &mut egui::Ui, label: &str, value: &str) {
     });
 }
 
+fn cast_disabled_reason(editor: &SkillEditorState) -> &'static str {
+    if editor.diagnostics.parse_error.is_some() {
+        "parse failed; no compiled preview"
+    } else if editor.diagnostics.compile_error.is_some() {
+        "compile failed; no previous compiled version"
+    } else {
+        "no compiled skill selected"
+    }
+}
+
+fn fit_rect_to_aspect(bounds: egui::Rect, aspect: f32) -> egui::Rect {
+    let width = bounds.width().max(1.0);
+    let height = bounds.height().max(1.0);
+    let bounds_aspect = width / height;
+    let size = if bounds_aspect > aspect {
+        egui::vec2(height * aspect, height)
+    } else {
+        egui::vec2(width, width / aspect)
+    };
+    egui::Rect::from_center_size(bounds.center(), size)
+}
+
 fn refresh_skill_bar(skill_bar: &mut SkillBar, editor: &SkillEditorState) {
     let previous = skill_bar
         .slots
@@ -419,18 +635,16 @@ fn refresh_skill_bar(skill_bar: &mut SkillBar, editor: &SkillEditorState) {
         .collect();
 }
 
-fn update_aim(
-    mut aim: ResMut<AimWorld>,
-    camera_query: Query<(&Camera, &GlobalTransform)>,
-    window: Single<&Window>,
-) {
-    let Ok((camera, camera_transform)) = camera_query.single() else {
-        return;
-    };
+fn update_aim(mut aim: ResMut<AimWorld>, preview_area: Res<PreviewArea>, window: Single<&Window>) {
     if let Some(cursor_position) = window.cursor_position()
-        && let Ok(world_pos) = camera.viewport_to_world_2d(camera_transform, cursor_position)
+        && let Some(rect) = preview_area.logical_rect
+        && rect.contains(cursor_position)
     {
-        aim.0 = world_pos;
+        let uv = (cursor_position - rect.min) / rect.size();
+        aim.0 = Vec2::new(
+            (uv.x - 0.5) * PREVIEW_WORLD_SIZE.x,
+            (0.5 - uv.y) * PREVIEW_WORLD_SIZE.y,
+        );
     }
 }
 
