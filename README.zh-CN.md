@@ -121,29 +121,32 @@ library.replace_from_ron(skill_source, &registry)?;
 
 如果要接入自己的游戏，需要实现这些 trait：
 
-- `SkillAction`：校验并执行 `Action(...)` 节点。
+- `SkillAction`：校验 `Action(...)` 节点，并产生 `SkillIntent` 消息。
 - `SkillModifier`：在编译前转换 stats 或技能计划。
 - `CastModel`：编译特殊施法模型，比如卡组式施法。
 
 ## 运行时模型
 
-编译后的技能存放在 `SkillLibrary` 中。运行时执行由 `PendingSkillExecutions` 管理。
+编译后的技能存放在 `SkillLibrary` 中。运行时执行采用 Bevy ECS-native 模型：
+每次施法请求都会生成一个 `ActiveSkill` entity，具体玩法效果通过 Bevy 消息交给普通 systems 处理。
 
 典型流程：
 
 1. 注册 actions、modifiers 和 cast models。
 2. 将 RON 加载到 `SkillLibrary`。
-3. 通过 `SkillId` 取得编译后的技能。
-4. 调用 `PendingSkillExecutions::cast`。
-5. 用经过的时间 tick 待执行技能。
-6. 当游戏事件发生时，为 `On(...)` 节点触发 runtime event。
-7. 需要时读取 `Emit(...)` 节点产生的事件。
+3. 发送 `SkillCastRequest { skill, caster, target }`。
+4. 由 `SkillDslPlugin` 创建并 tick `ActiveSkill` entities。
+5. 在普通 gameplay systems 中消费 `SkillIntent` 消息。
+6. 当游戏事件发生时，发送 `SkillRuntimeSignal` 以恢复 `On(...)` 节点。
+7. 需要时读取 `Emit(...)` 节点产生的 `SkillRuntimeSignal`。
 
 `SkillDslPlugin` 会安装核心 Bevy resources：
 
 - `SkillRegistry`
 - `SkillLibrary`
-- `PendingSkillExecutions`
+- `SkillRuntimeCounters`
+
+它也会注册核心技能消息和运行时 systems。
 
 ## 项目布局
 

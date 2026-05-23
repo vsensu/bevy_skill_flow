@@ -1,11 +1,13 @@
-use bevy::prelude::{App, World};
+use bevy::prelude::{App, Messages, Time};
 use bevy_skill_flow::{
-    ModifierDef, PendingSkillExecutions, SkillAction, SkillArgs, SkillContext, SkillError,
-    SkillExpr, SkillNode, SkillRegistry, SkillResult, SkillRuntimeEvent, SkillValue, StatModifier,
-    compile_skill, eval_skill_expr, parse_skill_def, parse_skill_document,
+    ActiveSkill, ModifierDef, SkillAction, SkillActionOutput, SkillArgs, SkillCastRequest,
+    SkillContext, SkillDslPlugin, SkillError, SkillExpr, SkillIntent, SkillNode, SkillRegistry,
+    SkillResult, SkillRuntimeSignal, SkillValue, StatModifier, compile_skill, eval_skill_expr,
+    parse_skill_def, parse_skill_document,
 };
-use bevy_skill_flow::{SkillCompiled, SkillDslPlugin, SkillLibrary, SkillPlan};
+use bevy_skill_flow::{SkillCompiled, SkillLibrary, SkillPlan};
 use bevy_skill_flow_gameplay::register_gameplay_primitives;
+use std::time::Duration;
 
 fn registry() -> SkillRegistry {
     let mut registry = SkillRegistry::with_core();
@@ -165,7 +167,7 @@ fn modifier_def_parses_from_ron() {
 
 #[test]
 fn execution_sequence_delay_and_on_event_resume() {
-    let registry = registry();
+    let mut registry = registry();
     let skill = parse_skill_def(
         r#"
         Skill(
@@ -179,39 +181,38 @@ fn execution_sequence_delay_and_on_event_resume() {
     "#,
     )
     .unwrap();
-
-    let mut registry = registry;
     registry.register_skill_action("record", RecordAction);
     let compiled = compile_skill(&skill, &registry).unwrap();
-    let mut world = World::new();
-    world.insert_resource(Records::default());
-    let caster = world.spawn_empty().id();
-    let mut pending = PendingSkillExecutions::default();
-    pending
-        .cast(&compiled, caster, &mut world, &registry)
-        .unwrap();
+    let mut app = runtime_app(registry, compiled);
+    let caster = app.world_mut().spawn_empty().id();
+    app.world_mut().write_message(SkillCastRequest {
+        skill: "timed".into(),
+        caster,
+        target: None,
+    });
+    app.update();
 
-    assert_eq!(records(&world), vec!["start"]);
-    assert_eq!(pending.len(), 1);
-    pending.tick(0.5, &mut world, &registry).unwrap();
-    assert_eq!(records(&world), vec!["start", "after_delay"]);
-    assert_eq!(pending.len(), 1);
+    assert_eq!(take_record_intents(&mut app), vec!["start"]);
+    assert_eq!(active_skill_count(&mut app), 1);
+
+    app.world_mut()
+        .resource_mut::<Time>()
+        .advance_by(Duration::from_millis(500));
+    app.update();
+    assert_eq!(take_record_intents(&mut app), vec!["after_delay"]);
+    assert_eq!(active_skill_count(&mut app), 1);
 
     let mut payload = SkillArgs::new();
     payload.insert("target".to_owned(), SkillValue::String("dummy".to_owned()));
-    pending
-        .trigger_event(
-            SkillRuntimeEvent::new("hit", payload),
-            &mut world,
-            &registry,
-        )
-        .unwrap();
-    assert_eq!(records(&world), vec!["start", "after_delay", "dummy"]);
-    assert!(pending.is_empty());
+    app.world_mut()
+        .write_message(SkillRuntimeSignal::new("hit", payload));
+    app.update();
+    assert_eq!(take_record_intents(&mut app), vec!["dummy"]);
+    assert_eq!(active_skill_count(&mut app), 0);
 }
 
 #[test]
-fn emitted_events_can_be_drained_after_cast_tick_and_event_resume() {
+fn emit_nodes_are_bevy_runtime_signals() {
     let registry = registry();
     let skill = parse_skill_def(
         r#"
@@ -227,14 +228,16 @@ fn emitted_events_can_be_drained_after_cast_tick_and_event_resume() {
     )
     .unwrap();
     let compiled = compile_skill(&skill, &registry).unwrap();
-    let mut world = World::new();
-    let caster = world.spawn_empty().id();
-    let mut pending = PendingSkillExecutions::default();
+    let mut app = runtime_app(registry, compiled);
+    let caster = app.world_mut().spawn_empty().id();
 
-    pending
-        .cast(&compiled, caster, &mut world, &registry)
-        .unwrap();
-    let events = pending.drain_emitted_events().collect::<Vec<_>>();
+    app.world_mut().write_message(SkillCastRequest {
+        skill: "emits".into(),
+        caster,
+        target: None,
+    });
+    app.update();
+    let events = take_runtime_signals(&mut app);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].name, "cast_started");
     assert_eq!(
@@ -242,8 +245,11 @@ fn emitted_events_can_be_drained_after_cast_tick_and_event_resume() {
         Some(&SkillValue::String("emits".to_owned()))
     );
 
-    pending.tick(0.25, &mut world, &registry).unwrap();
-    let events = pending.drain_emitted_events().collect::<Vec<_>>();
+    app.world_mut()
+        .resource_mut::<Time>()
+        .advance_by(Duration::from_millis(250));
+    app.update();
+    let events = take_runtime_signals(&mut app);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].name, "delay_ready");
     assert_eq!(
@@ -253,20 +259,59 @@ fn emitted_events_can_be_drained_after_cast_tick_and_event_resume() {
 
     let mut payload = SkillArgs::new();
     payload.insert("target".to_owned(), SkillValue::String("dummy".to_owned()));
-    pending
-        .trigger_event(
-            SkillRuntimeEvent::new("impact", payload),
-            &mut world,
-            &registry,
-        )
-        .unwrap();
-    let events = pending.drain_emitted_events().collect::<Vec<_>>();
+    app.world_mut()
+        .write_message(SkillRuntimeSignal::new("impact", payload));
+    app.update();
+    let events = take_runtime_signals(&mut app);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].name, "impact_seen");
     assert_eq!(
         events[0].payload.get("target"),
         Some(&SkillValue::String("dummy".to_owned()))
     );
+}
+
+#[test]
+fn parallel_waits_keep_skill_entity_until_all_branches_finish() {
+    let mut registry = registry();
+    registry.register_skill_action("record", RecordAction);
+    let skill = parse_skill_def(
+        r#"
+        Skill(
+          id: "parallel",
+          body: Parallel([
+            Delay(Expr("0.1"), Action("record", { "label": "a" })),
+            Delay(Expr("0.2"), Action("record", { "label": "b" })),
+          ]),
+        )
+    "#,
+    )
+    .unwrap();
+    let compiled = compile_skill(&skill, &registry).unwrap();
+    let mut app = runtime_app(registry, compiled);
+    let caster = app.world_mut().spawn_empty().id();
+
+    app.world_mut().write_message(SkillCastRequest {
+        skill: "parallel".into(),
+        caster,
+        target: None,
+    });
+    app.update();
+    assert_eq!(active_skill_count(&mut app), 1);
+
+    app.world_mut()
+        .resource_mut::<Time>()
+        .advance_by(Duration::from_millis(150));
+    app.update();
+    assert_eq!(take_record_intents(&mut app), vec!["a"]);
+    assert_eq!(active_skill_count(&mut app), 1);
+
+    app.world_mut()
+        .resource_mut::<Time>()
+        .advance_by(Duration::from_millis(100));
+    app.update();
+    assert_eq!(take_record_intents(&mut app), vec!["b"]);
+    assert_eq!(active_skill_count(&mut app), 0);
 }
 
 #[test]
@@ -380,7 +425,15 @@ fn bevy_plugin_installs_core_resources() {
             .has_cast_model("direct")
     );
     assert!(app.world().contains_resource::<SkillLibrary>());
-    assert!(app.world().contains_resource::<PendingSkillExecutions>());
+    assert!(
+        app.world()
+            .contains_resource::<bevy_skill_flow::SkillRuntimeCounters>()
+    );
+    assert!(
+        app.world()
+            .contains_resource::<Messages<SkillCastRequest>>()
+    );
+    assert!(app.world().contains_resource::<Messages<SkillIntent>>());
 }
 
 #[test]
@@ -406,9 +459,6 @@ fn library_replace_from_ron_supports_hot_reload_and_invalid_assets() {
     assert!(library.invalid(&"reloadable".into()).is_some());
 }
 
-#[derive(bevy::prelude::Resource, Default)]
-struct Records(Vec<String>);
-
 struct RecordAction;
 
 impl SkillAction for RecordAction {
@@ -416,19 +466,62 @@ impl SkillAction for RecordAction {
         Ok(())
     }
 
-    fn execute(&self, world: &mut World, _ctx: &mut SkillContext, args: &SkillArgs) -> SkillResult {
+    fn emit(
+        &self,
+        ctx: &SkillContext,
+        args: &SkillArgs,
+        out: &mut SkillActionOutput,
+    ) -> SkillResult {
         let label = match args.get("label") {
             Some(SkillValue::String(value)) => value.clone(),
             Some(SkillValue::Number(value)) => value.to_string(),
             other => format!("{other:?}"),
         };
-        world.resource_mut::<Records>().0.push(label);
-        Ok(())
+        let mut payload = SkillArgs::new();
+        payload.insert("label".to_owned(), SkillValue::String(label));
+        out.emit_intent(ctx, "record", payload)
     }
 }
 
-fn records(world: &World) -> Vec<String> {
-    world.resource::<Records>().0.clone()
+fn runtime_app(registry: SkillRegistry, compiled: SkillCompiled) -> App {
+    let mut app = App::new();
+    app.add_plugins(SkillDslPlugin);
+    app.init_resource::<Time>();
+    *app.world_mut().resource_mut::<SkillRegistry>() = registry;
+    app.world_mut()
+        .resource_mut::<SkillLibrary>()
+        .insert_compiled(compiled);
+    app
+}
+
+fn take_record_intents(app: &mut App) -> Vec<String> {
+    let mut messages = app.world_mut().resource_mut::<Messages<SkillIntent>>();
+    let records = messages
+        .iter_current_update_messages()
+        .filter(|intent| intent.kind == "record")
+        .filter_map(|intent| match intent.payload.get("label") {
+            Some(SkillValue::String(value)) => Some(value.clone()),
+            _ => None,
+        })
+        .collect();
+    messages.clear();
+    records
+}
+
+fn take_runtime_signals(app: &mut App) -> Vec<SkillRuntimeSignal> {
+    let mut messages = app
+        .world_mut()
+        .resource_mut::<Messages<SkillRuntimeSignal>>();
+    let signals = messages.iter_current_update_messages().cloned().collect();
+    messages.clear();
+    signals
+}
+
+fn active_skill_count(app: &mut App) -> usize {
+    app.world_mut()
+        .query::<&ActiveSkill>()
+        .iter(app.world())
+        .count()
 }
 
 fn compiled_with_stats(stats: Vec<(String, SkillValue)>) -> SkillCompiled {

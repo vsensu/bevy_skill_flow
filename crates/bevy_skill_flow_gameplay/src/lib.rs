@@ -1,10 +1,9 @@
 //! Gameplay primitives that demonstrate how to bind game semantics to
 //! `bevy_skill_flow`.
 
-use bevy::prelude::World;
 use bevy_skill_flow::{
-    CastModel, SkillAction, SkillArgs, SkillContext, SkillDef, SkillError, SkillNode, SkillPlan,
-    SkillRegistry, SkillResult, SkillValue, trace_arg,
+    CastModel, SkillAction, SkillActionOutput, SkillArgs, SkillContext, SkillDef, SkillError,
+    SkillNode, SkillPlan, SkillRegistry, SkillResult, SkillValue,
 };
 use indexmap::IndexMap;
 
@@ -16,12 +15,18 @@ impl SkillAction for TraceAction {
         Ok(())
     }
 
-    fn execute(&self, _world: &mut World, ctx: &mut SkillContext, args: &SkillArgs) -> SkillResult {
+    fn emit(
+        &self,
+        ctx: &SkillContext,
+        args: &SkillArgs,
+        out: &mut SkillActionOutput,
+    ) -> SkillResult {
         let label = trace_arg(args, "label")
             .or_else(|| trace_arg(args, "id"))
             .unwrap_or_else(|| "trace".to_owned());
-        ctx.trace.push(label);
-        Ok(())
+        let mut payload = SkillArgs::new();
+        payload.insert("label".to_owned(), SkillValue::String(label));
+        out.emit_intent(ctx, "trace", payload)
     }
 }
 
@@ -39,10 +44,16 @@ impl SkillAction for SpawnProjectileAction {
         Ok(())
     }
 
-    fn execute(&self, _world: &mut World, ctx: &mut SkillContext, args: &SkillArgs) -> SkillResult {
+    fn emit(
+        &self,
+        ctx: &SkillContext,
+        args: &SkillArgs,
+        out: &mut SkillActionOutput,
+    ) -> SkillResult {
         let prefab = trace_arg(args, "prefab").unwrap_or_else(|| "projectile".to_owned());
-        ctx.trace.push(format!("spawn_projectile:{prefab}"));
-        Ok(())
+        let mut payload = args.clone();
+        payload.insert("prefab".to_owned(), SkillValue::String(prefab));
+        out.emit_intent(ctx, "spawn_projectile", payload)
     }
 }
 
@@ -60,10 +71,18 @@ impl SkillAction for DamageAction {
         Ok(())
     }
 
-    fn execute(&self, _world: &mut World, ctx: &mut SkillContext, args: &SkillArgs) -> SkillResult {
+    fn emit(
+        &self,
+        ctx: &SkillContext,
+        args: &SkillArgs,
+        out: &mut SkillActionOutput,
+    ) -> SkillResult {
         let amount = trace_arg(args, "amount").unwrap_or_else(|| "?".to_owned());
-        ctx.trace.push(format!("damage:{amount}"));
-        Ok(())
+        let mut payload = args.clone();
+        payload
+            .entry("amount".to_owned())
+            .or_insert_with(|| SkillValue::String(amount));
+        out.emit_intent(ctx, "damage", payload)
     }
 }
 
@@ -81,11 +100,22 @@ impl SkillAction for SpellAction {
         Ok(())
     }
 
-    fn execute(&self, _world: &mut World, ctx: &mut SkillContext, args: &SkillArgs) -> SkillResult {
+    fn emit(
+        &self,
+        ctx: &SkillContext,
+        args: &SkillArgs,
+        out: &mut SkillActionOutput,
+    ) -> SkillResult {
         let id = trace_arg(args, "id").unwrap_or_else(|| "spell".to_owned());
         let bonus = trace_arg(args, "damage_bonus").unwrap_or_else(|| "0".to_owned());
-        ctx.trace.push(format!("spell:{id}:bonus={bonus}"));
-        Ok(())
+        let mut payload = args.clone();
+        payload
+            .entry("id".to_owned())
+            .or_insert_with(|| SkillValue::String(id));
+        payload
+            .entry("damage_bonus".to_owned())
+            .or_insert_with(|| SkillValue::String(bonus));
+        out.emit_intent(ctx, "spell", payload)
     }
 }
 
@@ -166,4 +196,13 @@ fn spell_action(id: &str, args: &SkillArgs, damage_bonus: f64) -> SkillNode {
         action_args.insert(key.clone(), value.clone());
     }
     SkillNode::Action("spell".to_owned(), action_args)
+}
+
+fn trace_arg(args: &SkillArgs, key: &str) -> Option<String> {
+    match args.get(key) {
+        Some(SkillValue::String(value)) => Some(value.clone()),
+        Some(SkillValue::Number(value)) => Some(value.to_string()),
+        Some(SkillValue::Bool(value)) => Some(value.to_string()),
+        _ => None,
+    }
 }

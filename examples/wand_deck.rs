@@ -1,12 +1,16 @@
-use bevy::prelude::World;
-use bevy_skill_flow::{PendingSkillExecutions, SkillLibrary, SkillRegistry};
+use bevy::prelude::{App, MinimalPlugins};
+use bevy_skill_flow::{SkillCastRequest, SkillDslPlugin, SkillIntent, SkillLibrary, SkillRegistry};
 use bevy_skill_flow_gameplay::{SpellAction, WandDeckCastModel};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut registry = SkillRegistry::with_core();
-    registry
-        .register_skill_action("spell", SpellAction)
-        .register_cast_model("wand_deck", WandDeckCastModel);
+    let mut app = App::new();
+    app.add_plugins((MinimalPlugins, SkillDslPlugin));
+    {
+        let mut registry = app.world_mut().resource_mut::<SkillRegistry>();
+        registry
+            .register_skill_action("spell", SpellAction)
+            .register_cast_model("wand_deck", WandDeckCastModel);
+    }
 
     let ron = r#"
         Skill(
@@ -21,15 +25,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     "#;
 
+    let registry = app.world().resource::<SkillRegistry>().clone();
     let mut library = SkillLibrary::default();
     library.replace_from_ron(ron, &registry)?;
-    let compiled = library.get(&"basic_wand".into()).expect("compiled skill");
+    *app.world_mut().resource_mut::<SkillLibrary>() = library;
 
-    let mut world = World::new();
-    let caster = world.spawn_empty().id();
-    let mut pending = PendingSkillExecutions::default();
-    let execution_id = pending.cast(compiled, caster, &mut world, &registry)?;
+    let caster = app.world_mut().spawn_empty().id();
+    app.world_mut().write_message(SkillCastRequest {
+        skill: "basic_wand".into(),
+        caster,
+        target: None,
+    });
+    app.update();
+    let intents = app
+        .world()
+        .resource::<bevy::prelude::Messages<SkillIntent>>()
+        .iter_current_update_messages()
+        .count();
 
-    println!("cast wand deck execution={execution_id}");
+    println!("cast wand deck intents={intents}");
     Ok(())
 }

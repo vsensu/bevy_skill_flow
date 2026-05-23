@@ -1,4 +1,4 @@
-use bevy::prelude::Entity;
+use bevy::prelude::{Entity, Message};
 use indexmap::{IndexMap, IndexSet};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -166,24 +166,24 @@ pub struct SkillCompiled {
     pub plan: SkillPlan,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SkillContext {
+    pub skill_entity: Option<Entity>,
     pub caster: Option<Entity>,
     pub skill_id: SkillId,
     pub current_target: Option<Entity>,
-    pub source_event: Option<SkillRuntimeEvent>,
+    pub source_event: Option<SkillRuntimeSignal>,
     pub vars: IndexMap<String, SkillValue>,
     pub stats: IndexMap<String, SkillValue>,
     pub tags: IndexSet<String>,
     pub rng_seed: u64,
     pub execution_id: u64,
-    pub trace: Vec<String>,
-    pub emitted: Vec<SkillRuntimeEvent>,
 }
 
 impl SkillContext {
     pub fn new(compiled: &SkillCompiled, caster: Option<Entity>, execution_id: u64) -> Self {
         Self {
+            skill_entity: None,
             caster,
             skill_id: compiled.id.clone(),
             current_target: None,
@@ -193,49 +193,79 @@ impl SkillContext {
             tags: compiled.tags.clone(),
             rng_seed: execution_id,
             execution_id,
-            trace: Vec::new(),
-            emitted: Vec::new(),
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct SkillRuntimeEvent {
+#[derive(Message, Clone, Debug, PartialEq)]
+pub struct SkillRuntimeSignal {
     pub name: String,
     pub payload: SkillArgs,
+    pub skill_entity: Option<Entity>,
+    pub caster: Option<Entity>,
+    pub target: Option<Entity>,
 }
 
-impl SkillRuntimeEvent {
+impl SkillRuntimeSignal {
     pub fn new(name: impl Into<String>, payload: SkillArgs) -> Self {
         Self {
             name: name.into(),
             payload,
+            skill_entity: None,
+            caster: None,
+            target: None,
         }
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Message, Clone, Debug)]
 pub struct SkillCastRequest {
     pub skill: SkillId,
     pub caster: Entity,
     pub target: Option<Entity>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Message, Clone, Debug)]
 pub struct SkillCastStarted {
     pub skill: SkillId,
     pub execution_id: u64,
+    pub skill_entity: Entity,
+    pub caster: Entity,
+    pub target: Option<Entity>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Message, Clone, Debug)]
 pub struct SkillCastFinished {
     pub skill: SkillId,
     pub execution_id: u64,
+    pub skill_entity: Entity,
+    pub caster: Entity,
+    pub target: Option<Entity>,
 }
 
-#[derive(Clone, Debug)]
-pub struct SkillExecutionError {
+#[derive(Message, Clone, Debug)]
+pub struct SkillCastRejected {
+    pub skill: SkillId,
+    pub caster: Entity,
+    pub target: Option<Entity>,
+    pub message: String,
+}
+
+#[derive(Message, Clone, Debug)]
+pub struct SkillExecutionFailed {
     pub skill: Option<SkillId>,
     pub execution_id: Option<u64>,
+    pub skill_entity: Option<Entity>,
     pub message: String,
+}
+
+pub type SkillExecutionError = SkillExecutionFailed;
+
+#[derive(Message, Clone, Debug, PartialEq)]
+pub struct SkillIntent {
+    pub kind: String,
+    pub skill_entity: Entity,
+    pub caster: Entity,
+    pub target: Option<Entity>,
+    pub payload: SkillArgs,
 }

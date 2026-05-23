@@ -12,9 +12,10 @@ use bevy_skill_flow::editor::{
     SkillEditorConfig, SkillEditorPlugin, SkillEditorState, is_skill_file,
 };
 use bevy_skill_flow::{
-    PendingSkillExecutions, SkillAction, SkillArgs, SkillContext, SkillDef, SkillDslPlugin,
-    SkillError, SkillExpr, SkillId, SkillLibrary, SkillNode, SkillRegistry, SkillResult,
-    SkillRuntimeEvent, SkillSpecialValue, SkillValue, StatModifier, StatOp,
+    ActiveSkill, SkillAction, SkillActionOutput, SkillArgs, SkillCastRequest, SkillContext,
+    SkillDef, SkillDslPlugin, SkillError, SkillExpr, SkillId, SkillIntent, SkillLibrary, SkillNode,
+    SkillRegistry, SkillResult, SkillRuntimeSignal, SkillSpecialValue, SkillValue, StatModifier,
+    StatOp,
 };
 use indexmap::IndexSet;
 use std::fs;
@@ -71,7 +72,7 @@ fn main() {
                 enemy_spawner,
                 enemy_chase,
                 handle_skill_input,
-                tick_skill_runtime,
+                consume_skill_intents,
                 update_projectiles,
                 update_zones,
                 drain_skill_events,
@@ -314,7 +315,7 @@ fn editor_ui(
     mut editor_ui_state: ResMut<EditorUiState>,
     mut skill_bar: ResMut<SkillBar>,
     mut preview_area: ResMut<PreviewArea>,
-    pending: Res<PendingSkillExecutions>,
+    active_skills: Query<&ActiveSkill>,
     log: Res<CombatLog>,
     preview_image: Res<PreviewImage>,
 ) -> Result {
@@ -366,7 +367,7 @@ fn editor_ui(
             }
             ui.separator();
             status_row(ui, "Compiled", &library.compiled_len().to_string());
-            status_row(ui, "Pending", &pending.len().to_string());
+            status_row(ui, "Pending", &active_skills.iter().count().to_string());
             ui.separator();
             ui.label("Log");
             for line in log.lines.iter().rev().take(6) {
@@ -1526,41 +1527,67 @@ fn handle_skill_input(world: &mut World) {
         direction,
     });
 
-    let Some(compiled) = world.resource::<SkillLibrary>().get(&skill_id).cloned() else {
+    if world.resource::<SkillLibrary>().get(&skill_id).is_none() {
         push_log(world, format!("missing compiled skill `{skill_id}`"));
         return;
-    };
-    let registry = world.resource::<SkillRegistry>().clone();
-    let mut pending = world
-        .remove_resource::<PendingSkillExecutions>()
-        .unwrap_or_default();
-    match pending.cast(&compiled, caster, world, &registry) {
-        Ok(_) => {
-            let mut skill_bar = world.resource_mut::<SkillBar>();
-            if let Some(slot) = skill_bar.slots.iter_mut().find(|slot| slot.id == skill_id) {
-                slot.remaining = slot.cooldown;
-            }
-        }
-        Err(err) => push_log(world, format!("skill error: {err}")),
     }
-    world.insert_resource(pending);
+    world.write_message(SkillCastRequest {
+        skill: skill_id.clone(),
+        caster,
+        target: None,
+    });
+    let mut skill_bar = world.resource_mut::<SkillBar>();
+    if let Some(slot) = skill_bar.slots.iter_mut().find(|slot| slot.id == skill_id) {
+        slot.remaining = slot.cooldown;
+    }
 }
 
-fn tick_skill_runtime(world: &mut World) {
-    let delta = world.resource::<Time>().delta_secs_f64();
-    let registry = world.resource::<SkillRegistry>().clone();
-    let mut pending = world
-        .remove_resource::<PendingSkillExecutions>()
-        .unwrap_or_default();
-    if let Err(err) = pending.tick(delta, world, &registry) {
-        push_log(world, format!("runtime tick error: {err}"));
+fn consume_skill_intents(world: &mut World) {
+    let intents = {
+        let mut messages = world.resource_mut::<Messages<SkillIntent>>();
+        let intents = messages
+            .iter_current_update_messages()
+            .cloned()
+            .collect::<Vec<_>>();
+        messages.clear();
+        intents
+    };
+
+    for intent in intents {
+        match intent.kind.as_str() {
+            "spawn_projectile" => spawn_projectile_intent(world, &intent.payload),
+            "spawn_zone" => spawn_zone_intent(world, &intent.payload),
+            "area_damage" => area_damage_intent(world, &intent.payload),
+            "combat_log" => {
+                let message = text_arg(&intent.payload, "message")
+                    .unwrap_or_else(|| "skill event".to_owned());
+                push_log(world, message);
+            }
+            "mark_blast" => mark_blast_intent(world, &intent.payload),
+            "detonate_marked_blast" => {
+                let Some(position) = world.resource_mut::<BlastQueue>().positions.pop() else {
+                    continue;
+                };
+                let mut area_args = intent.payload.clone();
+                area_args.insert("x".to_owned(), SkillValue::Number(position.x as f64));
+                area_args.insert("y".to_owned(), SkillValue::Number(position.y as f64));
+                area_args.insert("kind".to_owned(), SkillValue::String("blast".to_owned()));
+                area_damage_intent(world, &area_args);
+            }
+            "heal_or_shield" => {
+                let amount = number_arg(&intent.payload, "amount", 5.0);
+                let mode = text_arg(&intent.payload, "mode").unwrap_or_else(|| "shield".to_owned());
+                let mut stats = world.resource_mut::<PlayerStats>();
+                stats.shield = (stats.shield + amount).min(100.0);
+                push_log(world, format!("{mode} +{amount:.0}"));
+            }
+            _ => {}
+        }
     }
-    world.insert_resource(pending);
 }
 
 fn update_projectiles(world: &mut World) {
     let delta = world.resource::<Time>().delta_secs();
-    let registry = world.resource::<SkillRegistry>().clone();
     let mut hits = Vec::new();
     let mut despawn = Vec::new();
 
@@ -1605,7 +1632,7 @@ fn update_projectiles(world: &mut World) {
                 push_log(world, "enemy defeated".to_owned());
             }
             if let Some(name) = hit_event {
-                hits.push(SkillRuntimeEvent::new(
+                hits.push(SkillRuntimeSignal::new(
                     name,
                     [
                         ("x".to_owned(), SkillValue::Number(position.x as f64)),
@@ -1624,13 +1651,12 @@ fn update_projectiles(world: &mut World) {
         }
     }
     for event in hits {
-        trigger_runtime_event(world, &registry, event);
+        world.write_message(event);
     }
 }
 
 fn update_zones(world: &mut World) {
     let delta = world.resource::<Time>().delta();
-    let registry = world.resource::<SkillRegistry>().clone();
     let mut expired = Vec::new();
     let mut triggered = Vec::new();
 
@@ -1664,7 +1690,7 @@ fn update_zones(world: &mut World) {
         if touched {
             triggered.push((
                 zone_entity,
-                SkillRuntimeEvent::new(
+                SkillRuntimeSignal::new(
                     name,
                     [
                         ("x".to_owned(), SkillValue::Number(position.x as f64)),
@@ -1687,7 +1713,7 @@ fn update_zones(world: &mut World) {
             Color::srgba(0.5, 0.9, 1.0, 0.75),
             92.0,
         );
-        trigger_runtime_event(world, &registry, event);
+        world.write_message(event);
     }
     for entity in expired {
         if let Ok(entity_mut) = world.get_entity_mut(entity) {
@@ -1696,22 +1722,12 @@ fn update_zones(world: &mut World) {
     }
 }
 
-fn trigger_runtime_event(world: &mut World, registry: &SkillRegistry, event: SkillRuntimeEvent) {
-    let mut pending = world
-        .remove_resource::<PendingSkillExecutions>()
-        .unwrap_or_default();
-    if let Err(err) = pending.trigger_event(event, world, registry) {
-        push_log(world, format!("event trigger error: {err}"));
-    }
-    world.insert_resource(pending);
-}
-
 fn drain_skill_events(world: &mut World) {
-    let mut pending = world
-        .remove_resource::<PendingSkillExecutions>()
-        .unwrap_or_default();
-    let events = pending.drain_emitted_events().collect::<Vec<_>>();
-    world.insert_resource(pending);
+    let events = world
+        .resource::<Messages<SkillRuntimeSignal>>()
+        .iter_current_update_messages()
+        .cloned()
+        .collect::<Vec<_>>();
 
     for event in events {
         let label = text_arg(&event.payload, "label").unwrap_or_else(|| event.name.clone());
@@ -1752,7 +1768,7 @@ fn update_lifetimes(
 fn update_hud(
     skill_bar: Res<SkillBar>,
     stats: Res<PlayerStats>,
-    pending: Res<PendingSkillExecutions>,
+    active_skills: Query<&ActiveSkill>,
     enemies: Query<&Enemy>,
     log: Res<CombatLog>,
     mut hud: Single<&mut Text, With<HudText>>,
@@ -1762,7 +1778,7 @@ fn update_hud(
         "Shield: {:>4.0} | Enemies: {} | Pending runtime nodes: {}\n\n",
         stats.shield,
         enemies.iter().count(),
-        pending.len()
+        active_skills.iter().count()
     ));
     for (index, slot) in skill_bar.slots.iter().enumerate() {
         let state = if slot.remaining > 0.0 {
@@ -1842,6 +1858,125 @@ fn spawn_enemy(commands: &mut Commands, position: Vec2) {
     ));
 }
 
+fn spawn_projectile_intent(world: &mut World, args: &SkillArgs) {
+    let intent = world.resource::<CastIntent>();
+    let count = number_arg(args, "count", 1.0).round().max(1.0) as usize;
+    let speed = number_arg(args, "speed", 520.0);
+    let damage = number_arg(args, "damage", 10.0);
+    let radius = number_arg(args, "radius", 12.0);
+    let spread = number_arg(args, "spread_degrees", 0.0).to_radians();
+    let kind = text_arg(args, "kind").unwrap_or_else(|| "bolt".to_owned());
+    let hit_event = text_arg(args, "hit_event");
+    let base_angle = intent.direction.to_angle();
+    let color = match kind.as_str() {
+        "fire" => Color::srgb(1.0, 0.38, 0.12),
+        "bolt" => Color::srgb(0.88, 0.92, 1.0),
+        _ => Color::srgb(0.8, 0.8, 0.8),
+    };
+    let origin = intent.origin;
+
+    for index in 0..count {
+        let t = if count == 1 {
+            0.0
+        } else {
+            index as f32 / (count - 1) as f32 - 0.5
+        };
+        let direction = Vec2::from_angle(base_angle + spread * t);
+        world.spawn((
+            Sprite::from_color(color, Vec2::new(radius * 1.9, radius * 0.9)),
+            Transform {
+                translation: (origin + direction * 34.0).extend(12.0),
+                rotation: Quat::from_rotation_z(direction.to_angle()),
+                ..default()
+            },
+            Projectile {
+                velocity: direction * speed,
+                damage,
+                radius,
+                hit_event: hit_event.clone(),
+            },
+            Lifetime {
+                timer: Timer::from_seconds(1.7, TimerMode::Once),
+            },
+        ));
+    }
+}
+
+fn spawn_zone_intent(world: &mut World, args: &SkillArgs) {
+    let intent = world.resource::<CastIntent>();
+    let radius = number_arg(args, "radius", 80.0);
+    let ttl = number_arg(args, "ttl", 4.0);
+    let trigger_event = text_arg(args, "trigger_event");
+    let target = clamp_to_arena(intent.target);
+    world.spawn((
+        Sprite::from_color(
+            Color::srgba(0.25, 0.65, 1.0, 0.18),
+            Vec2::splat(radius * 2.0),
+        ),
+        Transform::from_xyz(target.x, target.y, 1.0),
+        Zone {
+            radius,
+            ttl: Timer::from_seconds(ttl, TimerMode::Once),
+            trigger_event,
+        },
+    ));
+}
+
+fn area_damage_intent(world: &mut World, args: &SkillArgs) {
+    let fallback = world.resource::<CastIntent>().target;
+    let center = Vec2::new(
+        number_arg(args, "x", fallback.x),
+        number_arg(args, "y", fallback.y),
+    );
+    let radius = number_arg(args, "radius", 80.0);
+    let amount = number_arg(args, "amount", 20.0);
+    let kind = text_arg(args, "kind").unwrap_or_else(|| "hit".to_owned());
+    let mut dead = Vec::new();
+    let mut hit_count = 0;
+
+    let mut enemy_query = world.query::<(Entity, &mut Enemy, &Transform)>();
+    for (entity, mut enemy, transform) in enemy_query.iter_mut(world) {
+        if transform.translation.xy().distance_squared(center) <= radius.powi(2) {
+            enemy.hp -= amount;
+            hit_count += 1;
+            if enemy.hp <= 0.0 {
+                dead.push(entity);
+            }
+        }
+    }
+    for entity in dead {
+        if let Ok(entity_mut) = world.get_entity_mut(entity) {
+            entity_mut.despawn();
+        }
+    }
+    spawn_flash(
+        world,
+        center,
+        Color::srgba(1.0, 0.78, 0.2, 0.55),
+        radius * 1.05,
+    );
+    push_log(world, format!("{kind} hit {hit_count} enemies"));
+}
+
+fn mark_blast_intent(world: &mut World, args: &SkillArgs) {
+    let intent = world.resource::<CastIntent>();
+    let position = clamp_to_arena(intent.target);
+    let radius = number_arg(args, "radius", 100.0);
+    let delay = number_arg(args, "delay", 0.7);
+    world.resource_mut::<BlastQueue>().positions.push(position);
+    world.spawn((
+        Sprite::from_color(
+            Color::srgba(1.0, 0.78, 0.16, 0.22),
+            Vec2::splat(radius * 2.0),
+        ),
+        Transform::from_xyz(position.x, position.y, 2.0),
+        BlastMarker { radius },
+        Lifetime {
+            timer: Timer::from_seconds(delay, TimerMode::Once),
+        },
+    ));
+}
+
 #[derive(Clone, Debug, Default)]
 struct SpawnGameplayProjectile;
 
@@ -1850,49 +1985,13 @@ impl SkillAction for SpawnGameplayProjectile {
         Ok(())
     }
 
-    fn execute(&self, world: &mut World, _ctx: &mut SkillContext, args: &SkillArgs) -> SkillResult {
-        let intent = world.resource::<CastIntent>();
-        let count = number_arg(args, "count", 1.0).round().max(1.0) as usize;
-        let speed = number_arg(args, "speed", 520.0);
-        let damage = number_arg(args, "damage", 10.0);
-        let radius = number_arg(args, "radius", 12.0);
-        let spread = number_arg(args, "spread_degrees", 0.0).to_radians();
-        let kind = text_arg(args, "kind").unwrap_or_else(|| "bolt".to_owned());
-        let hit_event = text_arg(args, "hit_event");
-        let base_angle = intent.direction.to_angle();
-        let color = match kind.as_str() {
-            "fire" => Color::srgb(1.0, 0.38, 0.12),
-            "bolt" => Color::srgb(0.88, 0.92, 1.0),
-            _ => Color::srgb(0.8, 0.8, 0.8),
-        };
-        let origin = intent.origin;
-
-        for index in 0..count {
-            let t = if count == 1 {
-                0.0
-            } else {
-                index as f32 / (count - 1) as f32 - 0.5
-            };
-            let direction = Vec2::from_angle(base_angle + spread * t);
-            world.spawn((
-                Sprite::from_color(color, Vec2::new(radius * 1.9, radius * 0.9)),
-                Transform {
-                    translation: (origin + direction * 34.0).extend(12.0),
-                    rotation: Quat::from_rotation_z(direction.to_angle()),
-                    ..default()
-                },
-                Projectile {
-                    velocity: direction * speed,
-                    damage,
-                    radius,
-                    hit_event: hit_event.clone(),
-                },
-                Lifetime {
-                    timer: Timer::from_seconds(1.7, TimerMode::Once),
-                },
-            ));
-        }
-        Ok(())
+    fn emit(
+        &self,
+        ctx: &SkillContext,
+        args: &SkillArgs,
+        out: &mut SkillActionOutput,
+    ) -> SkillResult {
+        out.emit_intent(ctx, "spawn_projectile", args.clone())
     }
 }
 
@@ -1904,25 +2003,13 @@ impl SkillAction for SpawnZoneAction {
         Ok(())
     }
 
-    fn execute(&self, world: &mut World, _ctx: &mut SkillContext, args: &SkillArgs) -> SkillResult {
-        let intent = world.resource::<CastIntent>();
-        let radius = number_arg(args, "radius", 80.0);
-        let ttl = number_arg(args, "ttl", 4.0);
-        let trigger_event = text_arg(args, "trigger_event");
-        let target = clamp_to_arena(intent.target);
-        world.spawn((
-            Sprite::from_color(
-                Color::srgba(0.25, 0.65, 1.0, 0.18),
-                Vec2::splat(radius * 2.0),
-            ),
-            Transform::from_xyz(target.x, target.y, 1.0),
-            Zone {
-                radius,
-                ttl: Timer::from_seconds(ttl, TimerMode::Once),
-                trigger_event,
-            },
-        ));
-        Ok(())
+    fn emit(
+        &self,
+        ctx: &SkillContext,
+        args: &SkillArgs,
+        out: &mut SkillActionOutput,
+    ) -> SkillResult {
+        out.emit_intent(ctx, "spawn_zone", args.clone())
     }
 }
 
@@ -1934,41 +2021,13 @@ impl SkillAction for AreaDamageAction {
         Ok(())
     }
 
-    fn execute(&self, world: &mut World, _ctx: &mut SkillContext, args: &SkillArgs) -> SkillResult {
-        let fallback = world.resource::<CastIntent>().target;
-        let center = Vec2::new(
-            number_arg(args, "x", fallback.x),
-            number_arg(args, "y", fallback.y),
-        );
-        let radius = number_arg(args, "radius", 80.0);
-        let amount = number_arg(args, "amount", 20.0);
-        let kind = text_arg(args, "kind").unwrap_or_else(|| "hit".to_owned());
-        let mut dead = Vec::new();
-        let mut hit_count = 0;
-
-        let mut enemy_query = world.query::<(Entity, &mut Enemy, &Transform)>();
-        for (entity, mut enemy, transform) in enemy_query.iter_mut(world) {
-            if transform.translation.xy().distance_squared(center) <= radius.powi(2) {
-                enemy.hp -= amount;
-                hit_count += 1;
-                if enemy.hp <= 0.0 {
-                    dead.push(entity);
-                }
-            }
-        }
-        for entity in dead {
-            if let Ok(entity_mut) = world.get_entity_mut(entity) {
-                entity_mut.despawn();
-            }
-        }
-        spawn_flash(
-            world,
-            center,
-            Color::srgba(1.0, 0.78, 0.2, 0.55),
-            radius * 1.05,
-        );
-        push_log(world, format!("{kind} hit {hit_count} enemies"));
-        Ok(())
+    fn emit(
+        &self,
+        ctx: &SkillContext,
+        args: &SkillArgs,
+        out: &mut SkillActionOutput,
+    ) -> SkillResult {
+        out.emit_intent(ctx, "area_damage", args.clone())
     }
 }
 
@@ -1980,10 +2039,13 @@ impl SkillAction for CombatLogAction {
         Ok(())
     }
 
-    fn execute(&self, world: &mut World, _ctx: &mut SkillContext, args: &SkillArgs) -> SkillResult {
-        let message = text_arg(args, "message").unwrap_or_else(|| "skill event".to_owned());
-        push_log(world, message);
-        Ok(())
+    fn emit(
+        &self,
+        ctx: &SkillContext,
+        args: &SkillArgs,
+        out: &mut SkillActionOutput,
+    ) -> SkillResult {
+        out.emit_intent(ctx, "combat_log", args.clone())
     }
 }
 
@@ -1995,24 +2057,13 @@ impl SkillAction for MarkBlastAction {
         Ok(())
     }
 
-    fn execute(&self, world: &mut World, _ctx: &mut SkillContext, args: &SkillArgs) -> SkillResult {
-        let intent = world.resource::<CastIntent>();
-        let position = clamp_to_arena(intent.target);
-        let radius = number_arg(args, "radius", 100.0);
-        let delay = number_arg(args, "delay", 0.7);
-        world.resource_mut::<BlastQueue>().positions.push(position);
-        world.spawn((
-            Sprite::from_color(
-                Color::srgba(1.0, 0.78, 0.16, 0.22),
-                Vec2::splat(radius * 2.0),
-            ),
-            Transform::from_xyz(position.x, position.y, 2.0),
-            BlastMarker { radius },
-            Lifetime {
-                timer: Timer::from_seconds(delay, TimerMode::Once),
-            },
-        ));
-        Ok(())
+    fn emit(
+        &self,
+        ctx: &SkillContext,
+        args: &SkillArgs,
+        out: &mut SkillActionOutput,
+    ) -> SkillResult {
+        out.emit_intent(ctx, "mark_blast", args.clone())
     }
 }
 
@@ -2024,15 +2075,13 @@ impl SkillAction for DetonateMarkedBlastAction {
         Ok(())
     }
 
-    fn execute(&self, world: &mut World, ctx: &mut SkillContext, args: &SkillArgs) -> SkillResult {
-        let Some(position) = world.resource_mut::<BlastQueue>().positions.pop() else {
-            return Ok(());
-        };
-        let mut area_args = args.clone();
-        area_args.insert("x".to_owned(), SkillValue::Number(position.x as f64));
-        area_args.insert("y".to_owned(), SkillValue::Number(position.y as f64));
-        area_args.insert("kind".to_owned(), SkillValue::String("blast".to_owned()));
-        AreaDamageAction.execute(world, ctx, &area_args)
+    fn emit(
+        &self,
+        ctx: &SkillContext,
+        args: &SkillArgs,
+        out: &mut SkillActionOutput,
+    ) -> SkillResult {
+        out.emit_intent(ctx, "detonate_marked_blast", args.clone())
     }
 }
 
@@ -2044,13 +2093,13 @@ impl SkillAction for HealOrShieldAction {
         Ok(())
     }
 
-    fn execute(&self, world: &mut World, _ctx: &mut SkillContext, args: &SkillArgs) -> SkillResult {
-        let amount = number_arg(args, "amount", 5.0);
-        let mode = text_arg(args, "mode").unwrap_or_else(|| "shield".to_owned());
-        let mut stats = world.resource_mut::<PlayerStats>();
-        stats.shield = (stats.shield + amount).min(100.0);
-        push_log(world, format!("{mode} +{amount:.0}"));
-        Ok(())
+    fn emit(
+        &self,
+        ctx: &SkillContext,
+        args: &SkillArgs,
+        out: &mut SkillActionOutput,
+    ) -> SkillResult {
+        out.emit_intent(ctx, "heal_or_shield", args.clone())
     }
 }
 
@@ -2095,7 +2144,7 @@ fn clamp_to_arena(value: Vec2) -> Vec2 {
     )
 }
 
-fn event_coord(event: &SkillRuntimeEvent) -> Vec2 {
+fn event_coord(event: &SkillRuntimeSignal) -> Vec2 {
     Vec2::new(
         number_arg(&event.payload, "x", 0.0),
         number_arg(&event.payload, "y", 0.0),

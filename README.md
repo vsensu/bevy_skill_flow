@@ -127,30 +127,33 @@ library.replace_from_ron(skill_source, &registry)?;
 
 For your own game, implement these traits:
 
-- `SkillAction`: validates and executes `Action(...)` nodes.
+- `SkillAction`: validates `Action(...)` nodes and emits `SkillIntent` messages.
 - `SkillModifier`: transforms stats or plans before compilation.
 - `CastModel`: compiles alternate body formats such as deck-based casting.
 
 ## Runtime Model
 
-Compiled skills are stored in `SkillLibrary`. Runtime execution is managed by
-`PendingSkillExecutions`.
+Compiled skills are stored in `SkillLibrary`. Runtime execution is Bevy
+ECS-native: each cast request spawns an `ActiveSkill` entity, and gameplay
+effects are exposed as Bevy messages.
 
 Typical flow:
 
 1. Register actions, modifiers, and cast models.
 2. Load RON into `SkillLibrary`.
-3. Fetch a compiled skill by `SkillId`.
-4. Call `PendingSkillExecutions::cast`.
-5. Tick pending execution with elapsed time.
-6. Trigger runtime events for `On(...)` nodes when game events happen.
-7. Drain emitted events from `Emit(...)` nodes when needed.
+3. Send `SkillCastRequest { skill, caster, target }`.
+4. Let `SkillDslPlugin` spawn and tick `ActiveSkill` entities.
+5. Consume `SkillIntent` messages in normal gameplay systems.
+6. Send `SkillRuntimeSignal` messages for `On(...)` nodes.
+7. Read `SkillRuntimeSignal` messages emitted by `Emit(...)` nodes when needed.
 
 `SkillDslPlugin` installs the core Bevy resources:
 
 - `SkillRegistry`
 - `SkillLibrary`
-- `PendingSkillExecutions`
+- `SkillRuntimeCounters`
+
+It also registers the core skill messages and runtime systems.
 
 ## Project Layout
 

@@ -20,7 +20,7 @@ pub use expr::*;
 pub use registry::*;
 pub use runtime::*;
 
-use bevy::prelude::{App, Plugin};
+use bevy::prelude::{App, IntoScheduleConfigs, Plugin, Update};
 
 /// Installs the resources used by the runtime.
 #[derive(Debug, Default)]
@@ -30,6 +30,22 @@ impl Plugin for SkillDslPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SkillRegistry>()
             .init_resource::<SkillLibrary>()
-            .init_resource::<PendingSkillExecutions>();
+            .init_resource::<SkillRuntimeCounters>()
+            .add_message::<SkillCastRequest>()
+            .add_message::<SkillCastStarted>()
+            .add_message::<SkillCastFinished>()
+            .add_message::<SkillCastRejected>()
+            .add_message::<SkillExecutionFailed>()
+            .add_message::<SkillRuntimeSignal>()
+            .add_message::<SkillIntent>()
+            .add_systems(
+                Update,
+                (
+                    handle_skill_cast_requests,
+                    tick_skill_delays,
+                    resume_skill_signals,
+                )
+                    .chain(),
+            );
     }
 }

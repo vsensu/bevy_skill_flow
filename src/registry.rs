@@ -1,5 +1,6 @@
 use crate::dsl::{SkillArgs, SkillCompiled, SkillContext, SkillDef, SkillPlan};
-use bevy::prelude::{Resource, World};
+use crate::runtime::SkillActionOutput;
+use bevy::prelude::Resource;
 use indexmap::IndexMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -26,7 +27,12 @@ pub enum SkillError {
 
 pub trait SkillAction: Send + Sync + 'static {
     fn validate(&self, args: &SkillArgs, registry: &SkillRegistry) -> Result<(), SkillError>;
-    fn execute(&self, world: &mut World, ctx: &mut SkillContext, args: &SkillArgs) -> SkillResult;
+    fn emit(
+        &self,
+        ctx: &SkillContext,
+        args: &SkillArgs,
+        out: &mut SkillActionOutput,
+    ) -> SkillResult;
 }
 
 pub trait SkillModifier: Send + Sync + 'static {
