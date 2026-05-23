@@ -1,30 +1,9 @@
-use bevy::prelude::{Entity, Message};
+use bevy::prelude::{Entity, Event, Message};
 use indexmap::{IndexMap, IndexSet};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub type SkillArgs = IndexMap<String, SkillValue>;
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SkillId(pub String);
-
-impl SkillId {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-}
-
-impl From<&str> for SkillId {
-    fn from(value: &str) -> Self {
-        Self(value.to_owned())
-    }
-}
-
-impl std::fmt::Display for SkillId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+pub type SkillId = bevy_skill_ecs::SkillId;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "Skill")]
@@ -147,23 +126,12 @@ impl<'de> Deserialize<'de> for SkillExpr {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct SkillPlan {
-    pub root: SkillNode,
-    pub stats: IndexMap<String, SkillValue>,
-}
-
-impl SkillPlan {
-    pub fn new(root: SkillNode, stats: IndexMap<String, SkillValue>) -> Self {
-        Self { root, stats }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct SkillCompiled {
     pub id: SkillId,
     pub tags: IndexSet<String>,
     pub cast_model: String,
-    pub plan: SkillPlan,
+    pub requirements: Vec<SkillRequirement>,
+    pub graph: bevy_skill_ecs::SkillGraph,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -178,6 +146,8 @@ pub struct SkillContext {
     pub tags: IndexSet<String>,
     pub rng_seed: u64,
     pub execution_id: u64,
+    pub step_budget: u32,
+    pub step_budget_remaining: u32,
 }
 
 impl SkillContext {
@@ -189,11 +159,47 @@ impl SkillContext {
             current_target: None,
             source_event: None,
             vars: IndexMap::new(),
-            stats: compiled.plan.stats.clone(),
+            stats: stats_from_graph(&compiled.graph),
             tags: compiled.tags.clone(),
             rng_seed: execution_id,
             execution_id,
+            step_budget: bevy_skill_ecs::SkillRuntimeConfig::default().step_budget,
+            step_budget_remaining: bevy_skill_ecs::SkillRuntimeConfig::default().step_budget,
         }
+    }
+}
+
+fn stats_from_graph(graph: &bevy_skill_ecs::SkillGraph) -> IndexMap<String, SkillValue> {
+    graph
+        .params
+        .iter()
+        .map(|(key, value)| (key.clone(), skill_value_from_ecs(value)))
+        .collect()
+}
+
+fn skill_value_from_ecs(value: &bevy_skill_ecs::SkillValue) -> SkillValue {
+    match value {
+        bevy_skill_ecs::SkillValue::Special(special) => SkillValue::Special(match special {
+            bevy_skill_ecs::SkillSpecialValue::Expr(expr) => SkillSpecialValue::Expr(expr.clone()),
+            bevy_skill_ecs::SkillSpecialValue::Ref(reference) => {
+                SkillSpecialValue::Ref(reference.clone())
+            }
+            bevy_skill_ecs::SkillSpecialValue::Tag(tag) => SkillSpecialValue::Tag(tag.clone()),
+            bevy_skill_ecs::SkillSpecialValue::Stat(stat) => SkillSpecialValue::Stat(stat.clone()),
+        }),
+        bevy_skill_ecs::SkillValue::Map(values) => SkillValue::Map(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), skill_value_from_ecs(value)))
+                .collect(),
+        ),
+        bevy_skill_ecs::SkillValue::List(values) => {
+            SkillValue::List(values.iter().map(skill_value_from_ecs).collect())
+        }
+        bevy_skill_ecs::SkillValue::Number(value) => SkillValue::Number(*value),
+        bevy_skill_ecs::SkillValue::Bool(value) => SkillValue::Bool(*value),
+        bevy_skill_ecs::SkillValue::String(value) => SkillValue::String(value.clone()),
+        bevy_skill_ecs::SkillValue::Null => SkillValue::Null,
     }
 }
 
@@ -201,16 +207,28 @@ impl SkillContext {
 pub struct SkillRuntimeSignal {
     pub name: String,
     pub payload: SkillArgs,
+    pub execution_id: Option<u64>,
     pub skill_entity: Option<Entity>,
     pub caster: Option<Entity>,
     pub target: Option<Entity>,
 }
 
-impl SkillRuntimeSignal {
+#[derive(Event, Clone, Debug, PartialEq)]
+pub struct SkillObserverTrigger {
+    pub name: String,
+    pub payload: SkillArgs,
+    pub execution_id: Option<u64>,
+    pub skill_entity: Option<Entity>,
+    pub caster: Option<Entity>,
+    pub target: Option<Entity>,
+}
+
+impl SkillObserverTrigger {
     pub fn new(name: impl Into<String>, payload: SkillArgs) -> Self {
         Self {
             name: name.into(),
             payload,
+            execution_id: None,
             skill_entity: None,
             caster: None,
             target: None,
@@ -218,37 +236,17 @@ impl SkillRuntimeSignal {
     }
 }
 
-#[derive(Message, Clone, Debug)]
-pub struct SkillCastRequest {
-    pub skill: SkillId,
-    pub caster: Entity,
-    pub target: Option<Entity>,
-}
-
-#[derive(Message, Clone, Debug)]
-pub struct SkillCastStarted {
-    pub skill: SkillId,
-    pub execution_id: u64,
-    pub skill_entity: Entity,
-    pub caster: Entity,
-    pub target: Option<Entity>,
-}
-
-#[derive(Message, Clone, Debug)]
-pub struct SkillCastFinished {
-    pub skill: SkillId,
-    pub execution_id: u64,
-    pub skill_entity: Entity,
-    pub caster: Entity,
-    pub target: Option<Entity>,
-}
-
-#[derive(Message, Clone, Debug)]
-pub struct SkillCastRejected {
-    pub skill: SkillId,
-    pub caster: Entity,
-    pub target: Option<Entity>,
-    pub message: String,
+impl SkillRuntimeSignal {
+    pub fn new(name: impl Into<String>, payload: SkillArgs) -> Self {
+        Self {
+            name: name.into(),
+            payload,
+            execution_id: None,
+            skill_entity: None,
+            caster: None,
+            target: None,
+        }
+    }
 }
 
 #[derive(Message, Clone, Debug)]
@@ -258,8 +256,6 @@ pub struct SkillExecutionFailed {
     pub skill_entity: Option<Entity>,
     pub message: String,
 }
-
-pub type SkillExecutionError = SkillExecutionFailed;
 
 #[derive(Message, Clone, Debug, PartialEq)]
 pub struct SkillIntent {

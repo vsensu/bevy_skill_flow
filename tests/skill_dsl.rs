@@ -1,11 +1,20 @@
-use bevy::prelude::{App, Messages, Time};
-use bevy_skill_flow::{
-    ActiveSkill, ModifierDef, SkillAction, SkillActionOutput, SkillArgs, SkillCastRequest,
-    SkillContext, SkillDslPlugin, SkillError, SkillExpr, SkillIntent, SkillNode, SkillRegistry,
-    SkillResult, SkillRuntimeSignal, SkillValue, StatModifier, compile_skill, eval_skill_expr,
-    parse_skill_def, parse_skill_document,
+use bevy::prelude::{App, FixedUpdate, Messages, Time};
+use bevy_skill_ecs::{
+    ApplyBuffRequest, DamageRequest, DamageResolved, ProjectileHit, SettlementMode, SkillGraph,
+    SkillGraphNodeKind, SkillId as EcsSkillId, SkillRuntimeConfig, SkillValue as EcsSkillValue,
 };
-use bevy_skill_flow::{SkillCompiled, SkillLibrary, SkillPlan};
+#[cfg(feature = "full_runtime_entities")]
+use bevy_skill_ecs::{ExecutionOfSkill, SkillChildOf, SkillPayloadOf, SkillRootOf};
+#[cfg(feature = "full_runtime_entities")]
+use bevy_skill_flow::SkillRuntimeDebugNode;
+use bevy_skill_flow::{
+    ActiveSkill, ActiveSkillBuff, ModifierDef, SkillAction, SkillActionOutput, SkillArgs,
+    SkillAssetSources, SkillCastRequest, SkillContext, SkillDslPlugin, SkillError,
+    SkillExecutionFailed, SkillExpr, SkillIntent, SkillObserverTrigger, SkillRegistry,
+    SkillResourcePools, SkillResult, SkillRuntimeSignal, SkillValue, StatModifier, compile_skill,
+    eval_skill_expr, parse_skill_def, parse_skill_document,
+};
+use bevy_skill_flow::{SkillCompiled, SkillLibrary};
 use bevy_skill_flow_gameplay::register_gameplay_primitives;
 use std::time::Duration;
 
@@ -13,6 +22,11 @@ fn registry() -> SkillRegistry {
     let mut registry = SkillRegistry::with_core();
     register_gameplay_primitives(&mut registry);
     registry
+}
+
+fn skill_update(app: &mut App) {
+    app.update();
+    app.world_mut().run_schedule(FixedUpdate);
 }
 
 #[test]
@@ -132,12 +146,12 @@ fn modifier_applies_in_order_and_keeps_original_skill_def_clean() {
     .unwrap();
     let compiled = compile_skill(&skill, &registry).unwrap();
     assert_eq!(
-        compiled.plan.stats.get("projectile_count"),
-        Some(&SkillValue::Number(5.0))
+        compiled.graph.params.get("projectile_count"),
+        Some(&EcsSkillValue::Number(5.0))
     );
     assert_eq!(
-        compiled.plan.stats.get("projectile_damage"),
-        Some(&SkillValue::Number(0.74))
+        compiled.graph.params.get("projectile_damage"),
+        Some(&EcsSkillValue::Number(0.74))
     );
     assert_eq!(
         skill.params.get("projectile_count"),
@@ -166,6 +180,70 @@ fn modifier_def_parses_from_ron() {
 }
 
 #[test]
+fn flow_ron_compiles_to_ordered_ecs_skill_graph() {
+    let skill = parse_skill_def(
+        r#"
+        Skill(
+          id: "ordered",
+          body: Sequence([
+            Action("trace", { "label": "first" }),
+            Action("trace", { "label": "second" }),
+            Action("spawn_projectile", {
+              "prefab": "bolt",
+              "on_hit": On("hit", Sequence([
+                Action("damage", { "amount": 10.0 }),
+                Action("trace", { "label": "after_damage" }),
+              ])),
+            }),
+          ]),
+        )
+    "#,
+    )
+    .unwrap();
+    let compiled = compile_skill(&skill, &registry()).unwrap();
+    compiled.graph.validate().unwrap();
+
+    let root = compiled.graph.node(compiled.graph.root.unwrap()).unwrap();
+    assert!(matches!(root.kind, SkillGraphNodeKind::Sequence));
+    let children = root.children.get("items").unwrap();
+    assert_eq!(children.len(), 3);
+    assert_extension(&compiled.graph, children[0], "trace");
+    assert_extension(&compiled.graph, children[1], "trace");
+    assert_extension(&compiled.graph, children[2], "spawn_projectile");
+
+    let projectile = compiled.graph.node(children[2]).unwrap();
+    let payload = projectile.payloads.get("on_hit").unwrap();
+    assert_eq!(payload.len(), 1);
+    let wait = compiled.graph.node(payload[0]).unwrap();
+    assert!(matches!(
+        &wait.kind,
+        SkillGraphNodeKind::WaitEvent { event } if event == "hit"
+    ));
+    let hit_children = wait.payloads.get("hit").unwrap();
+    assert_eq!(hit_children.len(), 1);
+    let hit_sequence = compiled.graph.node(hit_children[0]).unwrap();
+    let hit_order = hit_sequence.children.get("items").unwrap();
+    assert_extension(&compiled.graph, hit_order[0], "damage");
+    assert_extension(&compiled.graph, hit_order[1], "trace");
+}
+
+#[test]
+fn skill_graph_validation_reports_missing_root_and_cycles() {
+    let mut graph = SkillGraph::new(EcsSkillId::new("broken"));
+    assert_eq!(
+        graph.validate().unwrap_err().to_string(),
+        "skill graph has no root node"
+    );
+
+    let first = graph.add_node(SkillGraphNodeKind::Sequence);
+    let second = graph.add_node(SkillGraphNodeKind::Parallel);
+    graph.set_root(first);
+    graph.push_child(first, "items", second).unwrap();
+    graph.push_child(second, "branches", first).unwrap();
+    assert!(graph.validate().unwrap_err().to_string().contains("cycle"));
+}
+
+#[test]
 fn execution_sequence_delay_and_on_event_resume() {
     let mut registry = registry();
     let skill = parse_skill_def(
@@ -190,7 +268,7 @@ fn execution_sequence_delay_and_on_event_resume() {
         caster,
         target: None,
     });
-    app.update();
+    skill_update(&mut app);
 
     assert_eq!(take_record_intents(&mut app), vec!["start"]);
     assert_eq!(active_skill_count(&mut app), 1);
@@ -198,7 +276,7 @@ fn execution_sequence_delay_and_on_event_resume() {
     app.world_mut()
         .resource_mut::<Time>()
         .advance_by(Duration::from_millis(500));
-    app.update();
+    skill_update(&mut app);
     assert_eq!(take_record_intents(&mut app), vec!["after_delay"]);
     assert_eq!(active_skill_count(&mut app), 1);
 
@@ -206,7 +284,7 @@ fn execution_sequence_delay_and_on_event_resume() {
     payload.insert("target".to_owned(), SkillValue::String("dummy".to_owned()));
     app.world_mut()
         .write_message(SkillRuntimeSignal::new("hit", payload));
-    app.update();
+    skill_update(&mut app);
     assert_eq!(take_record_intents(&mut app), vec!["dummy"]);
     assert_eq!(active_skill_count(&mut app), 0);
 }
@@ -236,7 +314,7 @@ fn emit_nodes_are_bevy_runtime_signals() {
         caster,
         target: None,
     });
-    app.update();
+    skill_update(&mut app);
     let events = take_runtime_signals(&mut app);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].name, "cast_started");
@@ -248,7 +326,7 @@ fn emit_nodes_are_bevy_runtime_signals() {
     app.world_mut()
         .resource_mut::<Time>()
         .advance_by(Duration::from_millis(250));
-    app.update();
+    skill_update(&mut app);
     let events = take_runtime_signals(&mut app);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].name, "delay_ready");
@@ -261,7 +339,7 @@ fn emit_nodes_are_bevy_runtime_signals() {
     payload.insert("target".to_owned(), SkillValue::String("dummy".to_owned()));
     app.world_mut()
         .write_message(SkillRuntimeSignal::new("impact", payload));
-    app.update();
+    skill_update(&mut app);
     let events = take_runtime_signals(&mut app);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].name, "impact_seen");
@@ -296,22 +374,535 @@ fn parallel_waits_keep_skill_entity_until_all_branches_finish() {
         caster,
         target: None,
     });
-    app.update();
+    skill_update(&mut app);
     assert_eq!(active_skill_count(&mut app), 1);
 
     app.world_mut()
         .resource_mut::<Time>()
         .advance_by(Duration::from_millis(150));
-    app.update();
+    skill_update(&mut app);
     assert_eq!(take_record_intents(&mut app), vec!["a"]);
     assert_eq!(active_skill_count(&mut app), 1);
 
     app.world_mut()
         .resource_mut::<Time>()
         .advance_by(Duration::from_millis(100));
-    app.update();
+    skill_update(&mut app);
     assert_eq!(take_record_intents(&mut app), vec!["b"]);
     assert_eq!(active_skill_count(&mut app), 0);
+}
+
+#[test]
+fn if_and_repeat_execute_deterministically_in_one_update() {
+    let mut registry = registry();
+    registry.register_skill_action("record", RecordAction);
+    let skill = parse_skill_def(
+        r#"
+        Skill(
+          id: "control_flow",
+          params: { "enabled": true },
+          body: Sequence([
+            If(
+              condition: Expr("stat.enabled"),
+              then_node: Action("record", { "label": "then" }),
+              else_node: Some(Action("record", { "label": "else" })),
+            ),
+            Repeat(
+              times: Some(Expr("3")),
+              node: Action("record", { "label": "repeat" }),
+            ),
+          ]),
+        )
+    "#,
+    )
+    .unwrap();
+    let compiled = compile_skill(&skill, &registry).unwrap();
+    let mut app = runtime_app(registry, compiled);
+    let caster = app.world_mut().spawn_empty().id();
+
+    app.world_mut().write_message(SkillCastRequest {
+        skill: "control_flow".into(),
+        caster,
+        target: None,
+    });
+    skill_update(&mut app);
+
+    assert_eq!(
+        take_record_intents(&mut app),
+        vec!["then", "repeat", "repeat", "repeat"]
+    );
+    assert_eq!(active_skill_count(&mut app), 0);
+}
+
+#[test]
+fn step_budget_stops_overlong_synchronous_chains() {
+    let mut registry = registry();
+    registry.register_skill_action("record", RecordAction);
+    let skill = parse_skill_def(
+        r#"
+        Skill(
+          id: "too_long",
+          body: Sequence([
+            Action("record", { "label": "a" }),
+            Action("record", { "label": "b" }),
+            Action("record", { "label": "c" }),
+          ]),
+        )
+    "#,
+    )
+    .unwrap();
+    let compiled = compile_skill(&skill, &registry).unwrap();
+    let mut app = runtime_app(registry, compiled);
+    app.world_mut()
+        .resource_mut::<SkillRuntimeConfig>()
+        .step_budget = 2;
+    let caster = app.world_mut().spawn_empty().id();
+
+    app.world_mut().write_message(SkillCastRequest {
+        skill: "too_long".into(),
+        caster,
+        target: None,
+    });
+    skill_update(&mut app);
+
+    let failures = take_failures(&mut app);
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].message.contains("step budget exhausted"));
+    assert_eq!(active_skill_count(&mut app), 0);
+}
+
+#[test]
+fn cost_and_cooldown_requirements_validate_pay_and_reject() {
+    let mut registry = registry();
+    registry.register_skill_action("record", RecordAction);
+    let skill = parse_skill_def(
+        r#"
+        Skill(
+          id: "gated",
+          params: { "mana_cost": 10.0 },
+          requirements: [
+            Cost(resource: "mana", amount: Expr("stat.mana_cost")),
+            Cooldown(seconds: Expr("0.5")),
+          ],
+          body: Action("record", { "label": "cast" }),
+        )
+    "#,
+    )
+    .unwrap();
+    let compiled = compile_skill(&skill, &registry).unwrap();
+    let mut app = runtime_app(registry, compiled);
+    let caster = app.world_mut().spawn_empty().id();
+    app.world_mut()
+        .resource_mut::<SkillResourcePools>()
+        .set(caster, "mana", 15.0);
+
+    app.world_mut().write_message(SkillCastRequest {
+        skill: "gated".into(),
+        caster,
+        target: None,
+    });
+    skill_update(&mut app);
+    assert_eq!(take_record_intents(&mut app), vec!["cast"]);
+    assert_eq!(
+        app.world()
+            .resource::<SkillResourcePools>()
+            .get(caster, "mana"),
+        5.0
+    );
+
+    app.world_mut().write_message(SkillCastRequest {
+        skill: "gated".into(),
+        caster,
+        target: None,
+    });
+    skill_update(&mut app);
+    let rejected = take_rejections(&mut app);
+    assert_eq!(rejected.len(), 1);
+    assert!(rejected[0].message.contains("cooldown"));
+    assert_eq!(
+        app.world()
+            .resource::<SkillResourcePools>()
+            .get(caster, "mana"),
+        5.0
+    );
+
+    app.world_mut()
+        .resource_mut::<Time>()
+        .advance_by(Duration::from_millis(600));
+    app.world_mut().write_message(SkillCastRequest {
+        skill: "gated".into(),
+        caster,
+        target: None,
+    });
+    skill_update(&mut app);
+    let rejected = take_rejections(&mut app);
+    assert_eq!(rejected.len(), 1);
+    assert!(rejected[0].message.contains("not enough `mana`"));
+    assert_eq!(
+        app.world()
+            .resource::<SkillResourcePools>()
+            .get(caster, "mana"),
+        5.0
+    );
+}
+
+#[test]
+fn dirty_skill_asset_sources_hot_reload_new_casts() {
+    let mut app = App::new();
+    app.add_plugins(SkillDslPlugin);
+    app.init_resource::<Time>();
+    let mut registry = registry();
+    registry.register_skill_action("record", RecordAction);
+    *app.world_mut().resource_mut::<SkillRegistry>() = registry;
+
+    app.world_mut()
+        .resource_mut::<SkillAssetSources>()
+        .set_source(
+            "memory://reloadable.skill.ron",
+            r#"Skill(id: "reloadable", body: Action("record", { "label": "v1" }))"#,
+        );
+    skill_update(&mut app);
+    assert!(
+        app.world()
+            .resource::<SkillLibrary>()
+            .get(&"reloadable".into())
+            .is_some()
+    );
+
+    let caster = app.world_mut().spawn_empty().id();
+    app.world_mut().write_message(SkillCastRequest {
+        skill: "reloadable".into(),
+        caster,
+        target: None,
+    });
+    skill_update(&mut app);
+    assert_eq!(take_record_intents(&mut app), vec!["v1"]);
+
+    app.world_mut()
+        .resource_mut::<SkillAssetSources>()
+        .set_source(
+            "memory://reloadable.skill.ron",
+            r#"Skill(id: "reloadable", body: Action("record", { "label": "v2" }))"#,
+        );
+    skill_update(&mut app);
+
+    app.world_mut().write_message(SkillCastRequest {
+        skill: "reloadable".into(),
+        caster,
+        target: None,
+    });
+    skill_update(&mut app);
+    assert_eq!(take_record_intents(&mut app), vec!["v2"]);
+}
+
+#[test]
+fn damage_sync_request_and_await_modes_drive_messages_and_resume() {
+    let mut registry = registry();
+    registry.register_skill_action("record", RecordAction);
+    let skill = parse_skill_def(
+        r#"
+        Skill(
+          id: "damage_modes",
+          body: Sequence([
+            Action("damage", { "amount": 7.0, "mode": "sync" }),
+            Action("record", { "label": Expr("var.last_damage_amount") }),
+            Action("damage", { "amount": 11.0, "mode": "request" }),
+            Action("damage", { "amount": 13.0, "mode": "await" }),
+            Action("record", { "label": Expr("event.amount") }),
+          ]),
+        )
+    "#,
+    )
+    .unwrap();
+    let compiled = compile_skill(&skill, &registry).unwrap();
+    let mut app = runtime_app(registry, compiled);
+    let caster = app.world_mut().spawn_empty().id();
+    let target = app.world_mut().spawn_empty().id();
+
+    app.world_mut().write_message(SkillCastRequest {
+        skill: "damage_modes".into(),
+        caster,
+        target: Some(target),
+    });
+    skill_update(&mut app);
+
+    assert_eq!(take_record_intents(&mut app), vec!["7"]);
+    let requests = take_damage_requests(&mut app);
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].mode, SettlementMode::Sync);
+    assert_eq!(requests[1].mode, SettlementMode::Request);
+    assert_eq!(requests[2].mode, SettlementMode::Await);
+    assert_eq!(take_damage_resolved(&mut app).len(), 1);
+    assert_eq!(active_skill_count(&mut app), 1);
+
+    app.world_mut().write_message(DamageResolved {
+        request_id: requests[2].request_id,
+        execution_id: 1,
+        source: Some(caster),
+        target,
+        amount: 13.0,
+    });
+    skill_update(&mut app);
+
+    assert_eq!(take_record_intents(&mut app), vec!["13"]);
+    assert_eq!(active_skill_count(&mut app), 0);
+}
+
+#[cfg(feature = "full_runtime_entities")]
+#[test]
+fn full_runtime_entities_materializes_graph_relationships() {
+    let skill = parse_skill_def(
+        r#"
+        Skill(
+          id: "debug_entities",
+          body: Sequence([
+            Action("trace", { "label": "start" }),
+            Action("spawn_projectile", {
+              "prefab": "bolt",
+              "on_hit": On("hit", Action("trace", { "label": "hit" })),
+            }),
+          ]),
+        )
+    "#,
+    )
+    .unwrap();
+    let compiled = compile_skill(&skill, &registry()).unwrap();
+    let graph_node_count = compiled.graph.nodes.len();
+    let mut app = runtime_app(registry(), compiled);
+    let caster = app.world_mut().spawn_empty().id();
+
+    app.world_mut().write_message(SkillCastRequest {
+        skill: "debug_entities".into(),
+        caster,
+        target: None,
+    });
+    skill_update(&mut app);
+
+    let mut debug_query = app.world_mut().query::<&SkillRuntimeDebugNode>();
+    assert_eq!(debug_query.iter(app.world()).count(), graph_node_count);
+    assert_eq!(
+        app.world_mut()
+            .query::<&SkillRootOf>()
+            .iter(app.world())
+            .count(),
+        1
+    );
+    assert!(
+        app.world_mut()
+            .query::<&SkillChildOf>()
+            .iter(app.world())
+            .count()
+            >= 2
+    );
+    assert_eq!(
+        app.world_mut()
+            .query::<&SkillPayloadOf>()
+            .iter(app.world())
+            .count(),
+        2
+    );
+    assert_eq!(
+        app.world_mut()
+            .query::<&ExecutionOfSkill>()
+            .iter(app.world())
+            .count(),
+        graph_node_count
+    );
+}
+
+#[test]
+fn projectile_hit_message_resumes_hit_payload() {
+    let mut registry = registry();
+    registry.register_skill_action("record", RecordAction);
+    let skill = parse_skill_def(
+        r#"
+        Skill(
+          id: "projectile_payload",
+          body: On("hit", Action("record", { "label": "hit_payload" })),
+        )
+    "#,
+    )
+    .unwrap();
+    let compiled = compile_skill(&skill, &registry).unwrap();
+    let mut app = runtime_app(registry, compiled);
+    let caster = app.world_mut().spawn_empty().id();
+    let projectile = app.world_mut().spawn_empty().id();
+    let target = app.world_mut().spawn_empty().id();
+
+    app.world_mut().write_message(SkillCastRequest {
+        skill: "projectile_payload".into(),
+        caster,
+        target: None,
+    });
+    skill_update(&mut app);
+    assert_eq!(active_skill_count(&mut app), 1);
+
+    app.world_mut().write_message(ProjectileHit {
+        execution_id: 1,
+        projectile,
+        target: Some(target),
+        position: Some([1.0, 2.0, 0.0]),
+    });
+    skill_update(&mut app);
+
+    assert_eq!(take_record_intents(&mut app), vec!["hit_payload"]);
+    assert_eq!(active_skill_count(&mut app), 0);
+}
+
+#[test]
+fn fireball_flow_releases_hits_damages_burns_and_explodes() {
+    let mut registry = registry();
+    registry.register_skill_action("record", RecordAction);
+    let skill = parse_skill_def(
+        r#"
+        Skill(
+          id: "fireball_acceptance",
+          body: Parallel([
+            Action("spawn_projectile", { "prefab": "fireball" }),
+            On("hit", Sequence([
+              Action("damage", { "amount": 40.0, "mode": "request" }),
+              Action("apply_buff", {
+                "buff": "burning",
+                "duration": 3.0,
+                "on_add": Action("record", { "label": "burning" }),
+              }),
+            ])),
+            On("expire", Action("record", { "label": "explode" })),
+          ]),
+        )
+    "#,
+    )
+    .unwrap();
+    let compiled = compile_skill(&skill, &registry).unwrap();
+    let mut app = runtime_app(registry, compiled);
+    let caster = app.world_mut().spawn_empty().id();
+    let target = app.world_mut().spawn_empty().id();
+    let projectile = app.world_mut().spawn_empty().id();
+
+    app.world_mut().write_message(SkillCastRequest {
+        skill: "fireball_acceptance".into(),
+        caster,
+        target: None,
+    });
+    skill_update(&mut app);
+    assert_eq!(intent_count(&mut app, "spawn_projectile"), 1);
+    assert_eq!(active_skill_count(&mut app), 1);
+
+    app.world_mut().write_message(ProjectileHit {
+        execution_id: 1,
+        projectile,
+        target: Some(target),
+        position: Some([3.0, 0.0, 0.0]),
+    });
+    skill_update(&mut app);
+    assert_eq!(take_damage_requests(&mut app).len(), 1);
+    assert_eq!(take_apply_buff_requests(&mut app).len(), 1);
+    assert_eq!(take_record_intents(&mut app), vec!["burning"]);
+    assert_eq!(active_skill_count(&mut app), 1);
+
+    app.world_mut()
+        .write_message(SkillRuntimeSignal::new("expire", SkillArgs::new()));
+    skill_update(&mut app);
+    assert_eq!(take_record_intents(&mut app), vec!["explode"]);
+    assert_eq!(active_skill_count(&mut app), 0);
+}
+
+#[test]
+fn observer_trigger_resumes_waiting_payload() {
+    let mut registry = registry();
+    registry.register_skill_action("record", RecordAction);
+    let skill = parse_skill_def(
+        r#"
+        Skill(
+          id: "observer_payload",
+          body: On("observed_hit", Action("record", { "label": Expr("event.label") })),
+        )
+    "#,
+    )
+    .unwrap();
+    let compiled = compile_skill(&skill, &registry).unwrap();
+    let mut app = runtime_app(registry, compiled);
+    let caster = app.world_mut().spawn_empty().id();
+
+    app.world_mut().write_message(SkillCastRequest {
+        skill: "observer_payload".into(),
+        caster,
+        target: None,
+    });
+    skill_update(&mut app);
+    assert_eq!(active_skill_count(&mut app), 1);
+    let skill_entity = app
+        .world_mut()
+        .query::<(bevy::prelude::Entity, &ActiveSkill)>()
+        .iter(app.world())
+        .next()
+        .map(|(entity, _)| entity)
+        .unwrap();
+
+    let mut payload = SkillArgs::new();
+    payload.insert(
+        "label".to_owned(),
+        SkillValue::String("observer".to_owned()),
+    );
+    let mut trigger = SkillObserverTrigger::new("observed_hit", payload.clone());
+    trigger.skill_entity = Some(skill_entity);
+    trigger.execution_id = Some(999);
+    app.world_mut().trigger(trigger);
+    skill_update(&mut app);
+    assert!(take_record_intents(&mut app).is_empty());
+    assert_eq!(active_skill_count(&mut app), 1);
+
+    let mut trigger = SkillObserverTrigger::new("observed_hit", payload);
+    trigger.skill_entity = Some(skill_entity);
+    trigger.execution_id = Some(1);
+    app.world_mut().trigger(trigger);
+    skill_update(&mut app);
+
+    assert_eq!(take_record_intents(&mut app), vec!["observer"]);
+    assert_eq!(active_skill_count(&mut app), 0);
+}
+
+#[test]
+fn buff_add_and_remove_hooks_execute_as_skill_subgraphs() {
+    let mut registry = registry();
+    registry.register_skill_action("record", RecordAction);
+    let skill = parse_skill_def(
+        r#"
+        Skill(
+          id: "buff_hooks",
+          body: Action("apply_buff", {
+            "buff": "burning",
+            "duration": 0.1,
+            "on_add": Action("record", { "label": "add" }),
+            "on_remove": Action("record", { "label": "remove" }),
+          }),
+        )
+    "#,
+    )
+    .unwrap();
+    let compiled = compile_skill(&skill, &registry).unwrap();
+    let mut app = runtime_app(registry, compiled);
+    let caster = app.world_mut().spawn_empty().id();
+    let target = app.world_mut().spawn_empty().id();
+
+    app.world_mut().write_message(SkillCastRequest {
+        skill: "buff_hooks".into(),
+        caster,
+        target: Some(target),
+    });
+    skill_update(&mut app);
+
+    assert_eq!(take_record_intents(&mut app), vec!["add"]);
+    assert_eq!(take_apply_buff_requests(&mut app).len(), 1);
+    assert_eq!(active_buff_count(&mut app), 1);
+
+    app.world_mut()
+        .resource_mut::<Time>()
+        .advance_by(Duration::from_millis(200));
+    skill_update(&mut app);
+
+    assert_eq!(take_record_intents(&mut app), vec!["remove"]);
+    assert_eq!(active_buff_count(&mut app), 0);
 }
 
 #[test]
@@ -360,12 +951,12 @@ fn poe_fireball_gmp_compiles_payload_expressions() {
     .unwrap();
     let compiled = compile_skill(&skill, &registry).unwrap();
     assert_eq!(
-        compiled.plan.stats.get("projectile_count"),
-        Some(&SkillValue::Number(5.0))
+        compiled.graph.params.get("projectile_count"),
+        Some(&EcsSkillValue::Number(5.0))
     );
     assert_eq!(
-        compiled.plan.stats.get("projectile_damage"),
-        Some(&SkillValue::Number(0.74))
+        compiled.graph.params.get("projectile_damage"),
+        Some(&EcsSkillValue::Number(0.74))
     );
 }
 
@@ -387,32 +978,26 @@ fn noita_wand_deck_double_cast_consumes_two_spells() {
     )
     .unwrap();
     let compiled = compile_skill(&skill, &registry()).unwrap();
-    assert_eq!(
-        compiled.plan.root,
-        SkillNode::Sequence(vec![
-            SkillNode::Action(
-                "spell".to_owned(),
-                [
-                    ("id".to_owned(), SkillValue::String("spark_bolt".to_owned())),
-                    ("damage_bonus".to_owned(), SkillValue::Number(12.0)),
-                ]
-                .into_iter()
-                .collect()
-            ),
-            SkillNode::Action(
-                "spell".to_owned(),
-                [
-                    (
-                        "id".to_owned(),
-                        SkillValue::String("magic_missile".to_owned())
-                    ),
-                    ("damage_bonus".to_owned(), SkillValue::Number(12.0)),
-                ]
-                .into_iter()
-                .collect()
-            ),
-        ])
-    );
+    let root = compiled.graph.node(compiled.graph.root.unwrap()).unwrap();
+    assert!(matches!(root.kind, SkillGraphNodeKind::Sequence));
+    let spells = root.children.get("items").unwrap();
+    assert_eq!(spells.len(), 2);
+    let first = compiled.graph.node(spells[0]).unwrap();
+    let second = compiled.graph.node(spells[1]).unwrap();
+    assert!(matches!(
+        &first.kind,
+        SkillGraphNodeKind::Extension { constructor, args }
+            if constructor == "spell"
+                && args.get("id") == Some(&EcsSkillValue::String("spark_bolt".to_owned()))
+                && args.get("damage_bonus") == Some(&EcsSkillValue::Number(12.0))
+    ));
+    assert!(matches!(
+        &second.kind,
+        SkillGraphNodeKind::Extension { constructor, args }
+            if constructor == "spell"
+                && args.get("id") == Some(&EcsSkillValue::String("magic_missile".to_owned()))
+                && args.get("damage_bonus") == Some(&EcsSkillValue::Number(12.0))
+    ));
 }
 
 #[test]
@@ -429,34 +1014,17 @@ fn bevy_plugin_installs_core_resources() {
         app.world()
             .contains_resource::<bevy_skill_flow::SkillRuntimeCounters>()
     );
+    assert!(app.world().contains_resource::<SkillResourcePools>());
+    assert!(app.world().contains_resource::<SkillAssetSources>());
+    assert!(
+        app.world()
+            .contains_resource::<bevy_skill_flow::SkillCooldowns>()
+    );
     assert!(
         app.world()
             .contains_resource::<Messages<SkillCastRequest>>()
     );
     assert!(app.world().contains_resource::<Messages<SkillIntent>>());
-}
-
-#[test]
-fn library_replace_from_ron_supports_hot_reload_and_invalid_assets() {
-    let registry = registry();
-    let mut library = SkillLibrary::default();
-    library
-        .replace_from_ron(
-            r#"Skill(id: "reloadable", body: Action("trace", { "label": "v1" }))"#,
-            &registry,
-        )
-        .unwrap();
-    assert!(library.get(&"reloadable".into()).is_some());
-
-    let err = library
-        .replace_from_ron(
-            r#"Skill(id: "reloadable", body: Action("missing", {}))"#,
-            &registry,
-        )
-        .unwrap_err();
-    assert_eq!(err, SkillError::UnknownAction("missing".to_owned()));
-    assert!(library.get(&"reloadable".into()).is_none());
-    assert!(library.invalid(&"reloadable".into()).is_some());
 }
 
 struct RecordAction;
@@ -508,6 +1076,16 @@ fn take_record_intents(app: &mut App) -> Vec<String> {
     records
 }
 
+fn intent_count(app: &mut App, kind: &str) -> usize {
+    let mut messages = app.world_mut().resource_mut::<Messages<SkillIntent>>();
+    let count = messages
+        .iter_current_update_messages()
+        .filter(|intent| intent.kind == kind)
+        .count();
+    messages.clear();
+    count
+}
+
 fn take_runtime_signals(app: &mut App) -> Vec<SkillRuntimeSignal> {
     let mut messages = app
         .world_mut()
@@ -517,6 +1095,45 @@ fn take_runtime_signals(app: &mut App) -> Vec<SkillRuntimeSignal> {
     signals
 }
 
+fn take_failures(app: &mut App) -> Vec<SkillExecutionFailed> {
+    let mut messages = app
+        .world_mut()
+        .resource_mut::<Messages<SkillExecutionFailed>>();
+    let failures = messages.iter_current_update_messages().cloned().collect();
+    messages.clear();
+    failures
+}
+
+fn take_rejections(app: &mut App) -> Vec<bevy_skill_flow::SkillCastRejected> {
+    let mut messages = app
+        .world_mut()
+        .resource_mut::<Messages<bevy_skill_flow::SkillCastRejected>>();
+    let rejected = messages.iter_current_update_messages().cloned().collect();
+    messages.clear();
+    rejected
+}
+
+fn take_damage_requests(app: &mut App) -> Vec<DamageRequest> {
+    let mut messages = app.world_mut().resource_mut::<Messages<DamageRequest>>();
+    let requests = messages.iter_current_update_messages().cloned().collect();
+    messages.clear();
+    requests
+}
+
+fn take_damage_resolved(app: &mut App) -> Vec<DamageResolved> {
+    let mut messages = app.world_mut().resource_mut::<Messages<DamageResolved>>();
+    let resolved = messages.iter_current_update_messages().cloned().collect();
+    messages.clear();
+    resolved
+}
+
+fn take_apply_buff_requests(app: &mut App) -> Vec<ApplyBuffRequest> {
+    let mut messages = app.world_mut().resource_mut::<Messages<ApplyBuffRequest>>();
+    let requests = messages.iter_current_update_messages().cloned().collect();
+    messages.clear();
+    requests
+}
+
 fn active_skill_count(app: &mut App) -> usize {
     app.world_mut()
         .query::<&ActiveSkill>()
@@ -524,13 +1141,69 @@ fn active_skill_count(app: &mut App) -> usize {
         .count()
 }
 
+fn active_buff_count(app: &mut App) -> usize {
+    app.world_mut()
+        .query::<&ActiveSkillBuff>()
+        .iter(app.world())
+        .count()
+}
+
 fn compiled_with_stats(stats: Vec<(String, SkillValue)>) -> SkillCompiled {
+    let mut graph = SkillGraph::new(EcsSkillId::new("test"));
+    graph.params = stats
+        .into_iter()
+        .map(|(key, value)| (key, flow_value_to_ecs(value)))
+        .collect();
+    let root = graph.add_node(SkillGraphNodeKind::Sequence);
+    graph.set_root(root);
     SkillCompiled {
         id: "test".into(),
         tags: Default::default(),
         cast_model: "direct".to_owned(),
-        plan: SkillPlan::new(SkillNode::Sequence(Vec::new()), stats.into_iter().collect()),
+        requirements: Vec::new(),
+        graph,
     }
+}
+
+fn flow_value_to_ecs(value: SkillValue) -> EcsSkillValue {
+    match value {
+        SkillValue::Special(special) => EcsSkillValue::Special(match special {
+            bevy_skill_flow::SkillSpecialValue::Expr(expr) => {
+                bevy_skill_ecs::SkillSpecialValue::Expr(expr)
+            }
+            bevy_skill_flow::SkillSpecialValue::Ref(reference) => {
+                bevy_skill_ecs::SkillSpecialValue::Ref(reference)
+            }
+            bevy_skill_flow::SkillSpecialValue::Tag(tag) => {
+                bevy_skill_ecs::SkillSpecialValue::Tag(tag)
+            }
+            bevy_skill_flow::SkillSpecialValue::Stat(stat) => {
+                bevy_skill_ecs::SkillSpecialValue::Stat(stat)
+            }
+        }),
+        SkillValue::Map(values) => EcsSkillValue::Map(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, flow_value_to_ecs(value)))
+                .collect(),
+        ),
+        SkillValue::List(values) => {
+            EcsSkillValue::List(values.into_iter().map(flow_value_to_ecs).collect())
+        }
+        SkillValue::Number(value) => EcsSkillValue::Number(value),
+        SkillValue::Bool(value) => EcsSkillValue::Bool(value),
+        SkillValue::String(value) => EcsSkillValue::String(value),
+        SkillValue::Node(_) => EcsSkillValue::Null,
+        SkillValue::Null => EcsSkillValue::Null,
+    }
+}
+
+fn assert_extension(graph: &SkillGraph, id: bevy_skill_ecs::SkillNodeId, expected: &str) {
+    let node = graph.node(id).unwrap();
+    assert!(matches!(
+        &node.kind,
+        SkillGraphNodeKind::Extension { constructor, .. } if constructor == expected
+    ));
 }
 
 #[cfg(feature = "editor")]

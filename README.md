@@ -2,10 +2,11 @@
 
 A small, data-driven skill DSL and runtime for Bevy games.
 
-`bevy_skill_flow` keeps game semantics out of the core crate. The core knows how
-to parse, validate, compile, and run skill graphs; host games provide concrete
-actions, modifiers, and cast models such as projectiles, damage, buffs, or deck
-casting.
+`bevy_skill_flow` is the human-authored RON DSL layer. It compiles skill files
+into deterministic execution plans and an ECS-facing `SkillGraph` supplied by
+`bevy_skill_ecs`. Game semantics stay outside both core crates: host games
+provide concrete actions, modifiers, cast models, and systems such as
+projectiles, damage, buffs, or deck casting.
 
 [中文文档](README.zh-CN.md)
 
@@ -14,6 +15,7 @@ casting.
 This repository is organized as a Cargo workspace:
 
 - `bevy_skill_flow`: the core DSL, compiler, registry, runtime, RON loading, and optional editor support.
+- `bevy_skill_ecs`: the lower-level ECS skill graph, runtime protocol, system sets, messages, relationships, and execution configuration.
 - `bevy_skill_flow_gameplay`: a companion gameplay crate with reusable example primitives.
 
 The companion crate currently provides:
@@ -21,6 +23,7 @@ The companion crate currently provides:
 - `TraceAction`
 - `SpawnProjectileAction`
 - `DamageAction`
+- `ApplyBuffAction`
 - `SpellAction`
 - `WandDeckCastModel`
 - `register_gameplay_primitives`
@@ -33,6 +36,7 @@ implementations.
 
 - `demo_2d`: enables Bevy 2D support for the interactive demo.
 - `editor`: enables the skill editor demo and pulls in `bevy_egui`.
+- `full_runtime_entities`: materializes runtime graph nodes as debug entities with root, child, payload, and execution relationship components.
 
 The core dependency on Bevy is intentionally minimal:
 
@@ -110,32 +114,36 @@ The core DSL supports nodes such as:
 The core does not decide what `spawn_projectile`, `damage`, or `spell` mean.
 Those identifiers are resolved through a `SkillRegistry`.
 
+Compilation produces a runtime-authoritative `SkillGraph`: an ordered
+ECS-facing graph with child slots and payload slots such as `on_hit` or
+`on_expire`.
+
 ## Registering Game Semantics
 
 Use `SkillRegistry` to bind skill node names to host-game behavior:
 
 ```rust
-use bevy_skill_flow::{SkillLibrary, SkillRegistry};
+use bevy_skill_flow::{SkillAssetSources, SkillRegistry};
 use bevy_skill_flow_gameplay::register_gameplay_primitives;
 
 let mut registry = SkillRegistry::with_core();
 register_gameplay_primitives(&mut registry);
 
-let mut library = SkillLibrary::default();
-library.replace_from_ron(skill_source, &registry)?;
+let mut sources = SkillAssetSources::default();
+sources.set_source("memory://skill.ron", skill_source);
 ```
 
 For your own game, implement these traits:
 
 - `SkillAction`: validates `Action(...)` nodes and emits `SkillIntent` messages.
-- `SkillModifier`: transforms stats or plans before compilation.
+- `SkillModifier`: transforms skill params before graph compilation.
 - `CastModel`: compiles alternate body formats such as deck-based casting.
 
 ## Runtime Model
 
-Compiled skills are stored in `SkillLibrary`. Runtime execution is Bevy
-ECS-native: each cast request spawns an `ActiveSkill` entity, and gameplay
-effects are exposed as Bevy messages.
+Compiled skills are stored in `SkillLibrary`. Runtime execution uses the
+compiled `SkillGraph`: each cast request spawns an `ActiveSkill` entity, drains
+the ordered graph queue, and exposes gameplay effects as Bevy messages.
 
 Typical flow:
 
@@ -151,14 +159,59 @@ Typical flow:
 
 - `SkillRegistry`
 - `SkillLibrary`
+- `SkillAssetSources`
 - `SkillRuntimeCounters`
+- `SkillRuntimeConfig`
+- `SkillResourcePools`
+- `SkillCooldowns`
 
 It also registers the core skill messages and runtime systems.
+
+`SkillAssetSources` is a lightweight hot-reload source table. Insert or replace
+RON text with `set_source`; the runtime compiles dirty sources, updates
+`SkillLibrary`, and emits `SkillAssetReloaded` or `SkillAssetReloadFailed`.
+New casts use the newly compiled `SkillGraph`.
+
+The lower-level `SkillEcsPlugin` from `bevy_skill_ecs` installs the protocol
+messages and fixed runtime sets:
+
+```text
+Asset -> Request -> Validate -> Execute -> Effect -> Message -> Trigger -> Cleanup
+```
+
+The runtime drains synchronous chains deterministically and uses
+`SkillRuntimeConfig::step_budget` to stop runaway chains.
+
+Skill requirements are validated before an execution starts. `Cost` checks and
+spends values from `SkillResourcePools`; `Cooldown` checks and starts entries in
+`SkillCooldowns`. These are generic protocol resources keyed by caster and
+resource/skill id, so games can decide what names like `mana`, `energy`, or
+`charges` mean.
+
+`DamageAction` in the gameplay companion can emit protocol-level
+`DamageRequest` messages in three settlement modes:
+
+- `sync`: emits `DamageResolved` immediately and exposes `var.last_damage_amount`.
+- `request`: emits the request and lets the skill continue.
+- `await`: emits the request, pauses the execution branch, and resumes when a matching `DamageResolved` arrives.
+
+`ProjectileHit` messages resume `On("hit", ...)` / `On("projectile_hit", ...)`
+payloads for the matching execution. `ApplyBuffAction` emits
+`ApplyBuffRequest`, runs optional `on_add` hooks immediately, and stores
+optional `on_remove` hooks on a buff entity until its duration expires.
+
+For reactive Bevy Observer integration, trigger `SkillObserverTrigger`. The
+plugin registers an observer that converts it into a runtime signal, so
+`On("event_name", ...)` payloads can resume from either messages or observers.
+Set `skill_entity` to target a specific active skill execution; `execution_id`
+can narrow the signal further. `caster` and `target` are copied
+into the event context for expressions such as `event.target`.
 
 ## Project Layout
 
 ```text
-src/                         Core crate
+src/                         Flow DSL crate
+crates/bevy_skill_ecs/       ECS graph and runtime protocol crate
 crates/bevy_skill_flow_gameplay/
 examples/                    Command-line, 2D, and editor demos
 examples/assets/skills/      Example RON skills for the editor/demo
@@ -172,6 +225,7 @@ Useful local checks:
 ```sh
 cargo fmt
 cargo test -p bevy_skill_flow --all-targets --no-default-features
+cargo test -p bevy_skill_ecs
 cargo test -p bevy_skill_flow_gameplay
 cargo check -p bevy_skill_flow --example comprehensive_2d --features demo_2d
 cargo check -p bevy_skill_flow --example skill_editor --features editor

@@ -1,7 +1,7 @@
-use bevy::prelude::{App, MinimalPlugins};
+use bevy::prelude::{App, FixedUpdate, MinimalPlugins};
 use bevy_skill_flow::{
     SkillCastRequest, SkillDslPlugin, SkillIntent, SkillLibrary, SkillRegistry, SkillValue,
-    StatModifier, StatOp,
+    StatModifier, StatOp, compile_skill, parse_skill_def,
 };
 use bevy_skill_flow_gameplay::SpawnProjectileAction;
 
@@ -41,12 +41,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     "#;
 
     let registry = app.world().resource::<SkillRegistry>().clone();
+    let compiled = compile_skill(&parse_skill_def(ron)?, &registry)?;
     let mut library = SkillLibrary::default();
-    library.replace_from_ron(ron, &registry)?;
-    let compiled = library
-        .get(&"fireball".into())
-        .expect("compiled skill")
-        .clone();
+    library.insert_compiled(compiled.clone());
     *app.world_mut().resource_mut::<SkillLibrary>() = library;
 
     let caster = app.world_mut().spawn_empty().id();
@@ -56,6 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         target: None,
     });
     app.update();
+    app.world_mut().run_schedule(FixedUpdate);
     let intents = app
         .world()
         .resource::<bevy::prelude::Messages<SkillIntent>>()
@@ -66,8 +64,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "cast fireball intents={}, projectile_count={:?}, projectile_damage={:?}",
         intents.len(),
-        compiled.plan.stats.get("projectile_count"),
-        compiled.plan.stats.get("projectile_damage")
+        compiled.graph.params.get("projectile_count"),
+        compiled.graph.params.get("projectile_damage")
     );
     Ok(())
 }

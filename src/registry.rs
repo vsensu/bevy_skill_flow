@@ -1,7 +1,7 @@
-use crate::dsl::{SkillArgs, SkillCompiled, SkillContext, SkillDef, SkillPlan};
+use crate::dsl::{SkillArgs, SkillContext, SkillDef, SkillNode};
 use crate::runtime::SkillActionOutput;
 use bevy::prelude::Resource;
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -36,12 +36,12 @@ pub trait SkillAction: Send + Sync + 'static {
 }
 
 pub trait SkillModifier: Send + Sync + 'static {
-    fn applies(&self, skill: &SkillCompiled) -> bool;
-    fn apply(&self, plan: &mut SkillPlan, ctx: &SkillContext) -> Result<(), SkillError>;
+    fn applies(&self, tags: &IndexSet<String>) -> bool;
+    fn apply(&self, params: &mut SkillArgs, ctx: &SkillContext) -> Result<(), SkillError>;
 }
 
 pub trait CastModel: Send + Sync + 'static {
-    fn compile(&self, skill: &SkillDef, registry: &SkillRegistry) -> Result<SkillPlan, SkillError>;
+    fn compile(&self, skill: &SkillDef, registry: &SkillRegistry) -> Result<SkillNode, SkillError>;
 }
 
 #[derive(Resource, Clone)]

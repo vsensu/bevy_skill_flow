@@ -3,7 +3,7 @@ use bevy::window::WindowResolution;
 use bevy_skill_flow::{
     ActiveSkill, SkillAction, SkillActionOutput, SkillArgs, SkillCastRequest, SkillContext,
     SkillDslPlugin, SkillError, SkillId, SkillIntent, SkillRegistry, SkillResult,
-    SkillRuntimeSignal, SkillValue, StatModifier, StatOp,
+    SkillRuntimeSignal, SkillValue, StatModifier, StatOp, compile_skill, parse_skill_document,
 };
 
 const ARENA_HALF: Vec2 = Vec2::new(520.0, 310.0);
@@ -346,9 +346,11 @@ fn setup_skill_library(
             ),
         );
 
-    library
-        .replace_from_ron(SKILLS_RON, &registry)
-        .expect("demo skill RON should compile");
+    for skill in parse_skill_document(SKILLS_RON).expect("demo skill RON should parse") {
+        library.insert_compiled(
+            compile_skill(&skill, &registry).expect("demo skill RON should compile"),
+        );
+    }
 }
 
 fn update_aim(

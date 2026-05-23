@@ -361,7 +361,7 @@ fn editor_ui(
             ui.separator();
             if let Some(compiled) = editor.selected_compiled() {
                 ui.label("Stats");
-                for (key, value) in &compiled.plan.stats {
+                for (key, value) in &compiled.graph.params {
                     ui.monospace(format!("{key}: {value:?}"));
                 }
             }

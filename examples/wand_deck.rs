@@ -1,5 +1,8 @@
-use bevy::prelude::{App, MinimalPlugins};
-use bevy_skill_flow::{SkillCastRequest, SkillDslPlugin, SkillIntent, SkillLibrary, SkillRegistry};
+use bevy::prelude::{App, FixedUpdate, MinimalPlugins};
+use bevy_skill_flow::{
+    SkillCastRequest, SkillDslPlugin, SkillIntent, SkillLibrary, SkillRegistry, compile_skill,
+    parse_skill_def,
+};
 use bevy_skill_flow_gameplay::{SpellAction, WandDeckCastModel};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let registry = app.world().resource::<SkillRegistry>().clone();
     let mut library = SkillLibrary::default();
-    library.replace_from_ron(ron, &registry)?;
+    library.insert_compiled(compile_skill(&parse_skill_def(ron)?, &registry)?);
     *app.world_mut().resource_mut::<SkillLibrary>() = library;
 
     let caster = app.world_mut().spawn_empty().id();
@@ -37,6 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         target: None,
     });
     app.update();
+    app.world_mut().run_schedule(FixedUpdate);
     let intents = app
         .world()
         .resource::<bevy::prelude::Messages<SkillIntent>>()

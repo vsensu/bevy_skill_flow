@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["crates/bevy_skill_flow_gameplay"]
+members = ["crates/bevy_skill_ecs", "crates/bevy_skill_flow_gameplay"]
 resolver = "3"
 
 [dependencies]
 bevy = { version = "0.18.1", default-features = false }
+bevy_skill_ecs = { path = "crates/bevy_skill_ecs" }
 bevy_egui = { version = "0.39.1", optional = true }
 indexmap = { version = "2.7", features = ["serde"] }
 ron = "0.8"
@@ -19,6 +20,7 @@ thiserror = "2"
 [features]
 demo_2d = ["bevy/2d"]
 editor = ["demo_2d", "dep:bevy_egui"]
+full_runtime_entities = []
 
 [dev-dependencies]
 bevy_skill_flow_gameplay = { path = "crates/bevy_skill_flow_gameplay" }

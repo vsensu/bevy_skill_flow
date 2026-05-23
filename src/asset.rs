@@ -1,7 +1,7 @@
 use crate::compile::compile_skill;
 use crate::dsl::{SkillCompiled, SkillDef, SkillId};
 use crate::registry::{SkillError, SkillRegistry};
-use bevy::prelude::Resource;
+use bevy::prelude::{Message, Res, ResMut, Resource};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +37,68 @@ pub struct SkillLibrary {
     invalid: IndexMap<SkillId, SkillError>,
 }
 
+#[derive(Message, Clone, Debug, PartialEq)]
+pub struct SkillAssetReloaded {
+    pub key: String,
+    pub skills: Vec<SkillId>,
+}
+
+#[derive(Message, Clone, Debug, PartialEq)]
+pub struct SkillAssetReloadFailed {
+    pub key: String,
+    pub error: SkillError,
+}
+
+#[derive(Resource, Default, Clone, Debug)]
+pub struct SkillAssetSources {
+    sources: IndexMap<String, SkillAssetSource>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SkillAssetSource {
+    pub source: String,
+    pub version: u64,
+    pub applied_version: u64,
+    pub last_skills: Vec<SkillId>,
+    pub last_error: Option<SkillError>,
+}
+
+impl SkillAssetSources {
+    pub fn set_source(&mut self, key: impl Into<String>, source: impl Into<String>) {
+        let key = key.into();
+        let source = source.into();
+        match self.sources.get_mut(&key) {
+            Some(entry) => {
+                entry.source = source;
+                entry.version = entry.version.saturating_add(1);
+            }
+            None => {
+                self.sources.insert(
+                    key,
+                    SkillAssetSource {
+                        source,
+                        version: 1,
+                        applied_version: 0,
+                        last_skills: Vec::new(),
+                        last_error: None,
+                    },
+                );
+            }
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&SkillAssetSource> {
+        self.sources.get(key)
+    }
+
+    pub fn dirty_keys(&self) -> impl Iterator<Item = &String> {
+        self.sources
+            .iter()
+            .filter(|(_, source)| source.version != source.applied_version)
+            .map(|(key, _)| key)
+    }
+}
+
 impl SkillLibrary {
     pub fn get(&self, id: &SkillId) -> Option<&SkillCompiled> {
         self.compiled.get(id)
@@ -68,27 +130,64 @@ impl SkillLibrary {
         self.compiled.shift_remove(&id);
         self.invalid.insert(id, err);
     }
+}
 
-    pub fn replace_from_ron(
-        &mut self,
-        source: &str,
-        registry: &SkillRegistry,
-    ) -> Result<Vec<SkillId>, SkillError> {
-        let defs = parse_skill_document(source)?;
-        let mut updated = Vec::with_capacity(defs.len());
-        for def in defs {
-            let id = def.id.clone();
-            match compile_skill(&def, registry) {
-                Ok(compiled) => {
-                    self.insert_compiled(compiled);
-                    updated.push(id);
+pub fn compile_dirty_skill_assets(
+    mut sources: ResMut<SkillAssetSources>,
+    registry: Res<SkillRegistry>,
+    mut library: ResMut<SkillLibrary>,
+    mut reloaded: bevy::prelude::MessageWriter<SkillAssetReloaded>,
+    mut failed: bevy::prelude::MessageWriter<SkillAssetReloadFailed>,
+) {
+    let dirty = sources.dirty_keys().cloned().collect::<Vec<_>>();
+    for key in dirty {
+        let Some(snapshot) = sources.get(&key).cloned() else {
+            continue;
+        };
+        let result = compile_asset_source(&snapshot.source, &registry, &mut library);
+        let Some(entry) = sources.sources.get_mut(&key) else {
+            continue;
+        };
+        match result {
+            Ok(skills) => {
+                for old in &entry.last_skills {
+                    if !skills.contains(old) {
+                        library.remove(old);
+                    }
                 }
-                Err(err) => {
-                    self.mark_invalid(id.clone(), err.clone());
-                    return Err(err);
-                }
+                entry.last_skills = skills.clone();
+                entry.last_error = None;
+                entry.applied_version = snapshot.version;
+                reloaded.write(SkillAssetReloaded { key, skills });
+            }
+            Err(err) => {
+                entry.last_error = Some(err.clone());
+                entry.applied_version = snapshot.version;
+                failed.write(SkillAssetReloadFailed { key, error: err });
             }
         }
-        Ok(updated)
     }
+}
+
+fn compile_asset_source(
+    source: &str,
+    registry: &SkillRegistry,
+    library: &mut SkillLibrary,
+) -> Result<Vec<SkillId>, SkillError> {
+    let defs = parse_skill_document(source)?;
+    let mut updated = Vec::with_capacity(defs.len());
+    for def in defs {
+        let id = def.id.clone();
+        match compile_skill(&def, registry) {
+            Ok(compiled) => {
+                library.insert_compiled(compiled);
+                updated.push(id);
+            }
+            Err(err) => {
+                library.mark_invalid(id.clone(), err.clone());
+                return Err(err);
+            }
+        }
+    }
+    Ok(updated)
 }
