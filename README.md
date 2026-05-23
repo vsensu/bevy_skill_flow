@@ -112,7 +112,8 @@ The core DSL supports nodes such as:
 - `Spell`
 
 The core does not decide what `spawn_projectile`, `damage`, or `spell` mean.
-Those identifiers are resolved through a `SkillRegistry`.
+RON compilation preserves those identifiers as graph extension nodes; the ECS
+runtime resolves them through `SkillActionRegistry`.
 
 Compilation produces a runtime-authoritative `SkillGraph`: an ordered
 ECS-facing graph with child slots and payload slots such as `on_hit` or
@@ -120,14 +121,17 @@ ECS-facing graph with child slots and payload slots such as `on_hit` or
 
 ## Registering Game Semantics
 
-Use `SkillRegistry` to bind skill node names to host-game behavior:
+Use `SkillRegistry` for compile-time modifiers/cast models, and
+`SkillActionRegistry` for runtime action behavior:
 
 ```rust
+use bevy_skill_ecs::SkillActionRegistry;
 use bevy_skill_flow::{SkillAssetSources, SkillRegistry};
 use bevy_skill_flow_gameplay::register_gameplay_primitives;
 
 let mut registry = SkillRegistry::with_core();
-register_gameplay_primitives(&mut registry);
+let mut actions = SkillActionRegistry::new();
+register_gameplay_primitives(&mut registry, &mut actions);
 
 let mut sources = SkillAssetSources::default();
 sources.set_source("memory://skill.ron", skill_source);
@@ -135,27 +139,28 @@ sources.set_source("memory://skill.ron", skill_source);
 
 For your own game, implement these traits:
 
-- `SkillAction`: validates `Action(...)` nodes and emits `SkillIntent` messages.
+- `SkillAction`: runtime behavior for `Action(...)` graph extension nodes.
 - `SkillModifier`: transforms skill params before graph compilation.
 - `CastModel`: compiles alternate body formats such as deck-based casting.
 
 ## Runtime Model
 
-Compiled skills are stored in `SkillLibrary`. Runtime execution uses the
-compiled `SkillGraph`: each cast request spawns an `ActiveSkill` entity, drains
-the ordered graph queue, and exposes gameplay effects as Bevy messages.
+Compiled skills are stored in `bevy_skill_ecs::SkillLibrary`. Runtime execution
+lives in `bevy_skill_ecs` and uses the compiled `SkillGraph`: each cast request
+spawns an `ActiveSkill` entity, drains the ordered graph queue, and exposes
+gameplay effects as Bevy messages.
 
 Typical flow:
 
-1. Register actions, modifiers, and cast models.
+1. Register actions in `SkillActionRegistry`; register modifiers and cast models in `SkillRegistry`.
 2. Load RON into `SkillLibrary`.
 3. Send `SkillCastRequest { skill, caster, target }`.
-4. Let `SkillDslPlugin` spawn and tick `ActiveSkill` entities.
+4. Let `SkillEcsPlugin` (installed by `SkillDslPlugin`) spawn and tick `ActiveSkill` entities.
 5. Consume `SkillIntent` messages in normal gameplay systems.
 6. Send `SkillRuntimeSignal` messages for `On(...)` nodes.
 7. Read `SkillRuntimeSignal` messages emitted by `Emit(...)` nodes when needed.
 
-`SkillDslPlugin` installs the core Bevy resources:
+`SkillDslPlugin` installs `SkillEcsPlugin` plus the DSL asset resources:
 
 - `SkillRegistry`
 - `SkillLibrary`
@@ -165,7 +170,8 @@ Typical flow:
 - `SkillResourcePools`
 - `SkillCooldowns`
 
-It also registers the core skill messages and runtime systems.
+The runtime resources/messages/systems above are owned by `bevy_skill_ecs`;
+`bevy_skill_flow` adds RON source compilation into `SkillLibrary`.
 
 `SkillAssetSources` is a lightweight hot-reload source table. Insert or replace
 RON text with `set_source`; the runtime compiles dirty sources, updates
@@ -188,17 +194,21 @@ spends values from `SkillResourcePools`; `Cooldown` checks and starts entries in
 resource/skill id, so games can decide what names like `mana`, `energy`, or
 `charges` mean.
 
-`DamageAction` in the gameplay companion can emit protocol-level
-`DamageRequest` messages in three settlement modes:
+The core runtime only knows generic `SkillEffectRequest` /
+`SkillEffectResolved` messages. `DamageAction` in the gameplay companion maps
+damage onto that protocol and exposes gameplay-level `DamageRequest` /
+`DamageResolved` aliases in three settlement modes:
 
 - `sync`: emits `DamageResolved` immediately and exposes `var.last_damage_amount`.
 - `request`: emits the request and lets the skill continue.
 - `await`: emits the request, pauses the execution branch, and resumes when a matching `DamageResolved` arrives.
 
-`ProjectileHit` messages resume `On("hit", ...)` / `On("projectile_hit", ...)`
-payloads for the matching execution. `ApplyBuffAction` emits
-`ApplyBuffRequest`, runs optional `on_add` hooks immediately, and stores
-optional `on_remove` hooks on a buff entity until its duration expires.
+The gameplay companion owns `ProjectileHit` and bridges it into
+`SkillRuntimeSignal`, so `On("hit", ...)` / `On("projectile_hit", ...)`
+payloads can resume without making projectiles a core concept. `ApplyBuffAction`
+maps buff application onto a generic timed skill effect, runs optional `on_add`
+hooks immediately, and stores optional `on_remove` hooks until its duration
+expires.
 
 For reactive Bevy Observer integration, trigger `SkillObserverTrigger`. The
 plugin registers an observer that converts it into a runtime signal, so

@@ -105,20 +105,22 @@ Skill(
 - `Deck`
 - `Spell`
 
-核心不会定义 `spawn_projectile`、`damage` 或 `spell` 的真实含义。这些名字会通过 `SkillRegistry` 绑定到宿主游戏提供的实现。
+核心不会定义 `spawn_projectile`、`damage` 或 `spell` 的真实含义。RON 编译会把这些名字保留为 graph extension node，ECS runtime 再通过 `SkillActionRegistry` 解析它们。
 
 编译结果是运行时权威的 `SkillGraph`：面向 ECS 的有序技能图，保留 child slot 与 `on_hit`、`on_expire` 等 payload slot。
 
 ## 注册游戏语义
 
-使用 `SkillRegistry` 把技能节点名绑定到游戏行为：
+使用 `SkillRegistry` 注册编译期 modifier/cast model，使用 `SkillActionRegistry` 注册运行时 action 行为：
 
 ```rust
+use bevy_skill_ecs::SkillActionRegistry;
 use bevy_skill_flow::{SkillAssetSources, SkillRegistry};
 use bevy_skill_flow_gameplay::register_gameplay_primitives;
 
 let mut registry = SkillRegistry::with_core();
-register_gameplay_primitives(&mut registry);
+let mut actions = SkillActionRegistry::new();
+register_gameplay_primitives(&mut registry, &mut actions);
 
 let mut sources = SkillAssetSources::default();
 sources.set_source("memory://skill.ron", skill_source);
@@ -126,26 +128,26 @@ sources.set_source("memory://skill.ron", skill_source);
 
 如果要接入自己的游戏，需要实现这些 trait：
 
-- `SkillAction`：校验 `Action(...)` 节点，并产生 `SkillIntent` 消息。
+- `SkillAction`：为 `Action(...)` graph extension node 提供运行时行为。
 - `SkillModifier`：在 graph 编译前转换技能 params。
 - `CastModel`：编译特殊施法模型，比如卡组式施法。
 
 ## 运行时模型
 
-编译后的技能存放在 `SkillLibrary` 中。运行时执行使用编译后的 `SkillGraph`：
+编译后的技能存放在 `bevy_skill_ecs::SkillLibrary` 中。运行时执行属于 `bevy_skill_ecs`，并使用编译后的 `SkillGraph`：
 每次施法请求都会生成一个 `ActiveSkill` entity，按 graph queue 的确定顺序推进，具体玩法效果通过 Bevy 消息交给普通 systems 处理。
 
 典型流程：
 
-1. 注册 actions、modifiers 和 cast models。
+1. 在 `SkillActionRegistry` 注册 actions，在 `SkillRegistry` 注册 modifiers 和 cast models。
 2. 将 RON 加载到 `SkillLibrary`。
 3. 发送 `SkillCastRequest { skill, caster, target }`。
-4. 由 `SkillDslPlugin` 创建并 tick `ActiveSkill` entities。
+4. 由 `SkillDslPlugin` 安装的 `SkillEcsPlugin` 创建并 tick `ActiveSkill` entities。
 5. 在普通 gameplay systems 中消费 `SkillIntent` 消息。
 6. 当游戏事件发生时，发送 `SkillRuntimeSignal` 以恢复 `On(...)` 节点。
 7. 需要时读取 `Emit(...)` 节点产生的 `SkillRuntimeSignal`。
 
-`SkillDslPlugin` 会安装核心 Bevy resources：
+`SkillDslPlugin` 会安装 `SkillEcsPlugin` 以及 DSL asset resources：
 
 - `SkillRegistry`
 - `SkillLibrary`
@@ -155,7 +157,7 @@ sources.set_source("memory://skill.ron", skill_source);
 - `SkillResourcePools`
 - `SkillCooldowns`
 
-它也会注册核心技能消息和运行时 systems。
+上面的运行时 resources/messages/systems 由 `bevy_skill_ecs` 拥有；`bevy_skill_flow` 只把 RON source 编译进 `SkillLibrary`。
 
 `SkillAssetSources` 是一个轻量热重载 source table。通过 `set_source` 插入或替换 RON 文本后，runtime 会编译 dirty source、更新 `SkillLibrary`，并发出 `SkillAssetReloaded` 或 `SkillAssetReloadFailed`。新的释放会使用新编译出的 `SkillGraph`。
 
@@ -169,13 +171,13 @@ Asset -> Request -> Validate -> Execute -> Effect -> Message -> Trigger -> Clean
 
 技能 requirements 会在 execution 开始前校验。`Cost` 会检查并扣除 `SkillResourcePools` 中的数值；`Cooldown` 会检查并写入 `SkillCooldowns`。这两者都是按 caster 与 resource/skill id 索引的通用协议资源，真实项目可以自行决定 `mana`、`energy`、`charges` 等名字的含义。
 
-玩法扩展包里的 `DamageAction` 可以发出协议层 `DamageRequest`，支持三种结算模式：
+核心 runtime 只认识通用的 `SkillEffectRequest` / `SkillEffectResolved` 消息。玩法扩展包里的 `DamageAction` 会把伤害映射到这套协议，并在 gameplay 层提供 `DamageRequest` / `DamageResolved` 别名，支持三种结算模式：
 
 - `sync`：立即发出 `DamageResolved`，并写入 `var.last_damage_amount`。
 - `request`：只发请求，技能流程继续。
 - `await`：发请求后暂停当前执行分支，等匹配的 `DamageResolved` 到达后继续。
 
-`ProjectileHit` 消息会恢复同一 execution 上的 `On("hit", ...)` / `On("projectile_hit", ...)` payload。`ApplyBuffAction` 会发出 `ApplyBuffRequest`，立即执行可选 `on_add` hook，并把可选 `on_remove` hook 保存在 buff entity 上，持续时间结束时执行。
+`ProjectileHit` 由玩法扩展包拥有，并桥接成 `SkillRuntimeSignal`，因此 `On("hit", ...)` / `On("projectile_hit", ...)` payload 可以恢复，同时 projectile 不进入核心概念。`ApplyBuffAction` 会把 buff application 映射成通用 timed skill effect，立即执行可选 `on_add` hook，并把可选 `on_remove` hook 保留到持续时间结束时执行。
 
 如果要接入 Bevy Observer，可以触发 `SkillObserverTrigger`。插件会注册 observer，把它转换成 runtime signal，因此 `On("event_name", ...)` payload 既可以由消息恢复，也可以由 observer 触发恢复。设置 `skill_entity` 可以定向恢复某一次 active skill execution，`execution_id` 可以进一步限定同一次执行；`caster` 和 `target` 会复制到事件上下文，供 `event.target` 之类的表达式读取。
 

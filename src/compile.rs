@@ -1,5 +1,6 @@
 use crate::dsl::{
-    SkillArgs, SkillCompiled, SkillContext, SkillDef, SkillNode, SkillSpecialValue, SkillValue,
+    SkillArgs, SkillCompileContext, SkillCompiled, SkillDef, SkillNode, SkillSpecialValue,
+    SkillValue,
 };
 use crate::expr::{eval_skill_expr, resolve_value};
 use crate::registry::{CastModel, SkillError, SkillModifier, SkillRegistry};
@@ -44,12 +45,11 @@ pub fn compile_skill(
         }
     }
     validate_node(&root, registry)?;
-    let graph = graph_from_parts(&skill.id, &tags, &params, &root)?;
+    let graph = graph_from_parts(&skill.id, &tags, &params, &skill.requirements, &root)?;
     Ok(SkillCompiled {
         id: skill.id.clone(),
-        tags,
+        tags: tags.iter().cloned().collect(),
         cast_model: skill.cast_model.clone(),
-        requirements: skill.requirements.clone(),
         graph,
     })
 }
@@ -65,6 +65,7 @@ fn graph_from_parts(
     id: &crate::dsl::SkillId,
     tags: &IndexSet<String>,
     params: &SkillArgs,
+    requirements: &[bevy_skill_ecs::SkillRequirement],
     root: &SkillNode,
 ) -> Result<SkillGraph, SkillError> {
     let mut graph = SkillGraph::new(bevy_skill_ecs::SkillId::new(id.0.clone()));
@@ -73,6 +74,7 @@ fn graph_from_parts(
         .iter()
         .map(|(key, value)| Ok((key.clone(), to_ecs_value(value)?)))
         .collect::<Result<_, SkillError>>()?;
+    graph.requirements = requirements.to_vec();
     let root_id = append_graph_node(root, &mut graph)?;
     graph.set_root(root_id);
     graph
@@ -85,13 +87,9 @@ fn compile_context(
     id: &crate::dsl::SkillId,
     tags: &IndexSet<String>,
     params: &SkillArgs,
-) -> SkillContext {
-    SkillContext {
-        skill_entity: None,
-        caster: None,
+) -> SkillCompileContext {
+    SkillCompileContext {
         skill_id: id.clone(),
-        current_target: None,
-        source_event: None,
         vars: IndexMap::new(),
         stats: params.clone(),
         tags: tags.clone(),
@@ -355,11 +353,8 @@ pub fn validate_node(node: &SkillNode, registry: &SkillRegistry) -> Result<(), S
         }
         SkillNode::Emit(_, args) => validate_values(args.values())?,
         SkillNode::Action(id, args) => {
+            let _ = id;
             validate_values(args.values())?;
-            let action = registry
-                .action(id)
-                .ok_or_else(|| SkillError::UnknownAction(id.clone()))?;
-            action.validate(args, registry)?;
         }
         SkillNode::Deck(_) | SkillNode::Spell(_, _) | SkillNode::Modifier(_, _) => {
             return Err(SkillError::Runtime(
@@ -429,7 +424,7 @@ impl SkillModifier for StatModifier {
                 .any(|tag| tags.contains(tag.as_str()))
     }
 
-    fn apply(&self, params: &mut SkillArgs, ctx: &SkillContext) -> Result<(), SkillError> {
+    fn apply(&self, params: &mut SkillArgs, ctx: &SkillCompileContext) -> Result<(), SkillError> {
         for op in &self.ops {
             match op {
                 StatOp::Add(name, value) => {
@@ -452,7 +447,7 @@ impl SkillModifier for StatModifier {
     }
 }
 
-fn value_as_number(value: &SkillValue, ctx: &SkillContext) -> Result<f64, SkillError> {
+fn value_as_number(value: &SkillValue, ctx: &SkillCompileContext) -> Result<f64, SkillError> {
     let resolved = match value {
         SkillValue::Special(SkillSpecialValue::Expr(expr)) => {
             eval_skill_expr(&crate::dsl::SkillExpr(expr.clone()), ctx)?

@@ -1,8 +1,8 @@
 //! ECS-facing skill runtime protocol and graph model.
 //!
 //! This crate intentionally contains no game combat semantics. Concrete
-//! effects such as damage, projectiles, buffs, or wand cards are represented by
-//! extension nodes/components supplied by a host game or a higher-level DSL.
+//! gameplay effects are represented by extension nodes/components supplied by a
+//! host game or a higher-level DSL.
 
 use bevy::prelude::{
     App, Component, Entity, IntoScheduleConfigs, Message, Plugin, Reflect, Resource, SystemSet,
@@ -10,6 +10,12 @@ use bevy::prelude::{
 use indexmap::{IndexMap, IndexSet};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+mod expr;
+mod runtime;
+
+pub use expr::*;
+pub use runtime::*;
 
 pub type SkillParams = IndexMap<String, SkillValue>;
 pub type SkillTags = IndexSet<String>;
@@ -89,12 +95,43 @@ pub enum SkillSpecialValue {
     Stat(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Reflect, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Reflect)]
 pub struct SkillExpr(pub String);
 
 impl SkillExpr {
     pub fn new(expr: impl Into<String>) -> Self {
         Self(expr.into())
+    }
+}
+
+impl Serialize for SkillExpr {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_newtype_variant("SkillExpr", 0, "Expr", &self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SkillExpr {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match SkillValue::deserialize(deserializer)? {
+            SkillValue::Special(SkillSpecialValue::Expr(expr)) | SkillValue::String(expr) => {
+                Ok(Self(expr))
+            }
+            SkillValue::List(values) if values.len() == 1 => match values.into_iter().next() {
+                Some(SkillValue::String(expr)) => Ok(Self(expr)),
+                other => Err(serde::de::Error::custom(format!(
+                    "expected Expr(\"...\"), got `{other:?}`"
+                ))),
+            },
+            other => Err(serde::de::Error::custom(format!(
+                "expected a string expression or Expr(\"...\"), got `{other:?}`"
+            ))),
+        }
     }
 }
 
@@ -105,6 +142,8 @@ pub struct SkillGraph {
     pub tags: SkillTags,
     #[serde(default)]
     pub params: SkillParams,
+    #[serde(default)]
+    pub requirements: Vec<SkillRequirement>,
     pub root: Option<SkillNodeId>,
     #[serde(default)]
     pub nodes: Vec<SkillGraphNode>,
@@ -116,6 +155,7 @@ impl SkillGraph {
             id,
             tags: SkillTags::new(),
             params: SkillParams::new(),
+            requirements: Vec::new(),
             root: None,
             nodes: Vec::new(),
         }
@@ -222,6 +262,59 @@ impl SkillGraph {
         visiting.shift_remove(&id);
         visited.insert(id);
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum SkillRequirement {
+    Cost { resource: String, amount: SkillExpr },
+    Cooldown { seconds: SkillExpr },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SkillCompiled {
+    pub id: SkillId,
+    pub tags: SkillTags,
+    pub cast_model: String,
+    pub graph: SkillGraph,
+}
+
+#[derive(Resource, Default, Clone, Debug)]
+pub struct SkillLibrary {
+    compiled: IndexMap<SkillId, SkillCompiled>,
+    invalid: IndexMap<SkillId, String>,
+}
+
+impl SkillLibrary {
+    pub fn get(&self, id: &SkillId) -> Option<&SkillCompiled> {
+        self.compiled.get(id)
+    }
+
+    pub fn invalid(&self, id: &SkillId) -> Option<&String> {
+        self.invalid.get(id)
+    }
+
+    pub fn insert_compiled(&mut self, skill: SkillCompiled) {
+        self.invalid.shift_remove(&skill.id);
+        self.compiled.insert(skill.id.clone(), skill);
+    }
+
+    pub fn remove(&mut self, id: &SkillId) {
+        self.compiled.shift_remove(id);
+        self.invalid.shift_remove(id);
+    }
+
+    pub fn compiled_ids(&self) -> impl Iterator<Item = &SkillId> {
+        self.compiled.keys()
+    }
+
+    pub fn compiled_len(&self) -> usize {
+        self.compiled.len()
+    }
+
+    pub fn mark_invalid(&mut self, id: SkillId, err: impl Into<String>) {
+        self.compiled.shift_remove(&id);
+        self.invalid.insert(id, err.into());
     }
 }
 
@@ -362,17 +455,12 @@ pub struct ExecutionOwnedBy {
 }
 
 #[derive(Component, Clone, Debug, Reflect, PartialEq)]
-pub struct ProjectileFromExecution {
+pub struct SkillObjectFromExecution {
     pub execution: Entity,
 }
 
 #[derive(Component, Clone, Debug, Reflect, PartialEq)]
-pub struct BuffFromExecution {
-    pub execution: Entity,
-}
-
-#[derive(Component, Clone, Debug, Reflect, PartialEq)]
-pub struct AuraAffectsTarget {
+pub struct SkillAffectsTarget {
     pub target: Entity,
 }
 
@@ -442,38 +530,24 @@ pub struct SkillExecutionFinished {
 }
 
 #[derive(Message, Clone, Debug)]
-pub struct DamageRequest {
+pub struct SkillEffectRequest {
     pub request_id: u64,
     pub execution_id: u64,
     pub source: Option<Entity>,
-    pub target: Entity,
-    pub amount: f64,
+    pub target: Option<Entity>,
+    pub kind: String,
+    pub payload: SkillParams,
     pub mode: SettlementMode,
 }
 
 #[derive(Message, Clone, Debug)]
-pub struct DamageResolved {
+pub struct SkillEffectResolved {
     pub request_id: u64,
     pub execution_id: u64,
     pub source: Option<Entity>,
-    pub target: Entity,
-    pub amount: f64,
-}
-
-#[derive(Message, Clone, Debug)]
-pub struct ApplyBuffRequest {
-    pub execution_id: u64,
-    pub target: Entity,
-    pub buff: String,
-    pub duration_seconds: Option<f64>,
-}
-
-#[derive(Message, Clone, Debug)]
-pub struct ProjectileHit {
-    pub execution_id: u64,
-    pub projectile: Entity,
     pub target: Option<Entity>,
-    pub position: Option<[f32; 3]>,
+    pub kind: String,
+    pub payload: SkillParams,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -520,14 +594,21 @@ pub struct SkillEcsPlugin;
 impl Plugin for SkillEcsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SkillRuntimeConfig>()
+            .init_resource::<SkillLibrary>()
+            .init_resource::<SkillActionRegistry>()
+            .init_resource::<SkillRuntimeCounters>()
+            .init_resource::<SkillResourcePools>()
+            .init_resource::<SkillCooldowns>()
             .add_message::<SkillCastRequest>()
             .add_message::<SkillCastAccepted>()
             .add_message::<SkillCastRejected>()
             .add_message::<SkillExecutionFinished>()
-            .add_message::<DamageRequest>()
-            .add_message::<DamageResolved>()
-            .add_message::<ApplyBuffRequest>()
-            .add_message::<ProjectileHit>()
+            .add_message::<SkillExecutionFailed>()
+            .add_message::<SkillRuntimeSignal>()
+            .add_message::<SkillIntent>()
+            .add_message::<SkillEffectRequest>()
+            .add_message::<SkillEffectResolved>()
+            .add_observer(skill_observer_trigger_bridge)
             .configure_sets(
                 bevy::prelude::FixedUpdate,
                 (
@@ -541,6 +622,18 @@ impl Plugin for SkillEcsPlugin {
                     SkillRuntimeSet::Cleanup,
                 )
                     .chain(),
+            )
+            .add_systems(
+                bevy::prelude::FixedUpdate,
+                (
+                    tick_skill_cooldowns.in_set(SkillRuntimeSet::Request),
+                    (handle_skill_cast_requests, tick_skill_delays)
+                        .chain()
+                        .in_set(SkillRuntimeSet::Execute),
+                    resume_effect_resolved.in_set(SkillRuntimeSet::Message),
+                    resume_skill_signals.in_set(SkillRuntimeSet::Trigger),
+                    tick_skill_effects.in_set(SkillRuntimeSet::Cleanup),
+                ),
             );
     }
 }

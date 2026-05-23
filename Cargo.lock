@@ -1384,6 +1384,7 @@ name = "bevy_skill_flow_gameplay"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bevy_skill_ecs",
  "bevy_skill_flow",
  "indexmap",
 ]

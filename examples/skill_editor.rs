@@ -8,6 +8,9 @@ use bevy_egui::{
     EguiContexts, EguiGlobalSettings, EguiPlugin, EguiPrimaryContextPass, EguiTextureHandle,
     EguiUserTextures, PrimaryEguiContext, egui,
 };
+use bevy_skill_ecs::{
+    SkillActionInput, SkillActionRegistry, SkillParams as RuntimeArgs, SkillValue as RuntimeValue,
+};
 use bevy_skill_flow::editor::{
     SkillEditorConfig, SkillEditorPlugin, SkillEditorState, is_skill_file,
 };
@@ -268,33 +271,34 @@ fn setup_scene(
 fn setup_editor_library(
     config: Res<SkillEditorConfig>,
     mut registry: ResMut<SkillRegistry>,
+    mut actions: ResMut<SkillActionRegistry>,
     mut library: ResMut<SkillLibrary>,
     mut editor: ResMut<SkillEditorState>,
     mut skill_bar: ResMut<SkillBar>,
     mut log: ResMut<CombatLog>,
 ) {
-    registry
+    actions
         .register_skill_action("spawn_projectile", SpawnGameplayProjectile)
         .register_skill_action("spawn_zone", SpawnZoneAction)
         .register_skill_action("area_damage", AreaDamageAction)
         .register_skill_action("combat_log", CombatLogAction)
         .register_skill_action("mark_blast", MarkBlastAction)
         .register_skill_action("detonate_marked_blast", DetonateMarkedBlastAction)
-        .register_skill_action("heal_or_shield", HealOrShieldAction)
-        .register_skill_modifier(
-            "fan_out",
-            StatModifier::new(
-                vec!["projectile".to_owned()],
-                vec![
-                    StatOp::Add("projectile_count".to_owned(), SkillValue::Number(4.0)),
-                    StatOp::Set(
-                        "projectile_spread_degrees".to_owned(),
-                        SkillValue::Number(34.0),
-                    ),
-                    StatOp::Mul("projectile_damage".to_owned(), SkillValue::Number(0.68)),
-                ],
-            ),
-        );
+        .register_skill_action("heal_or_shield", HealOrShieldAction);
+    registry.register_skill_modifier(
+        "fan_out",
+        StatModifier::new(
+            vec!["projectile".to_owned()],
+            vec![
+                StatOp::Add("projectile_count".to_owned(), SkillValue::Number(4.0)),
+                StatOp::Set(
+                    "projectile_spread_degrees".to_owned(),
+                    SkillValue::Number(34.0),
+                ),
+                StatOp::Mul("projectile_damage".to_owned(), SkillValue::Number(0.68)),
+            ],
+        ),
+    );
 
     if let Err(err) = seed_default_skills(&config.skills_dir) {
         log.lines.push(format!("seed skills failed: {err}"));
@@ -1569,9 +1573,9 @@ fn consume_skill_intents(world: &mut World) {
                     continue;
                 };
                 let mut area_args = intent.payload.clone();
-                area_args.insert("x".to_owned(), SkillValue::Number(position.x as f64));
-                area_args.insert("y".to_owned(), SkillValue::Number(position.y as f64));
-                area_args.insert("kind".to_owned(), SkillValue::String("blast".to_owned()));
+                area_args.insert("x".to_owned(), RuntimeValue::Number(position.x as f64));
+                area_args.insert("y".to_owned(), RuntimeValue::Number(position.y as f64));
+                area_args.insert("kind".to_owned(), RuntimeValue::String("blast".to_owned()));
                 area_damage_intent(world, &area_args);
             }
             "heal_or_shield" => {
@@ -1635,8 +1639,8 @@ fn update_projectiles(world: &mut World) {
                 hits.push(SkillRuntimeSignal::new(
                     name,
                     [
-                        ("x".to_owned(), SkillValue::Number(position.x as f64)),
-                        ("y".to_owned(), SkillValue::Number(position.y as f64)),
+                        ("x".to_owned(), RuntimeValue::Number(position.x as f64)),
+                        ("y".to_owned(), RuntimeValue::Number(position.y as f64)),
                     ]
                     .into_iter()
                     .collect(),
@@ -1693,8 +1697,8 @@ fn update_zones(world: &mut World) {
                 SkillRuntimeSignal::new(
                     name,
                     [
-                        ("x".to_owned(), SkillValue::Number(position.x as f64)),
-                        ("y".to_owned(), SkillValue::Number(position.y as f64)),
+                        ("x".to_owned(), RuntimeValue::Number(position.x as f64)),
+                        ("y".to_owned(), RuntimeValue::Number(position.y as f64)),
                     ]
                     .into_iter()
                     .collect(),
@@ -1858,7 +1862,7 @@ fn spawn_enemy(commands: &mut Commands, position: Vec2) {
     ));
 }
 
-fn spawn_projectile_intent(world: &mut World, args: &SkillArgs) {
+fn spawn_projectile_intent(world: &mut World, args: &RuntimeArgs) {
     let intent = world.resource::<CastIntent>();
     let count = number_arg(args, "count", 1.0).round().max(1.0) as usize;
     let speed = number_arg(args, "speed", 520.0);
@@ -1902,7 +1906,7 @@ fn spawn_projectile_intent(world: &mut World, args: &SkillArgs) {
     }
 }
 
-fn spawn_zone_intent(world: &mut World, args: &SkillArgs) {
+fn spawn_zone_intent(world: &mut World, args: &RuntimeArgs) {
     let intent = world.resource::<CastIntent>();
     let radius = number_arg(args, "radius", 80.0);
     let ttl = number_arg(args, "ttl", 4.0);
@@ -1922,7 +1926,7 @@ fn spawn_zone_intent(world: &mut World, args: &SkillArgs) {
     ));
 }
 
-fn area_damage_intent(world: &mut World, args: &SkillArgs) {
+fn area_damage_intent(world: &mut World, args: &RuntimeArgs) {
     let fallback = world.resource::<CastIntent>().target;
     let center = Vec2::new(
         number_arg(args, "x", fallback.x),
@@ -1958,7 +1962,7 @@ fn area_damage_intent(world: &mut World, args: &SkillArgs) {
     push_log(world, format!("{kind} hit {hit_count} enemies"));
 }
 
-fn mark_blast_intent(world: &mut World, args: &SkillArgs) {
+fn mark_blast_intent(world: &mut World, args: &RuntimeArgs) {
     let intent = world.resource::<CastIntent>();
     let position = clamp_to_arena(intent.target);
     let radius = number_arg(args, "radius", 100.0);
@@ -1981,17 +1985,21 @@ fn mark_blast_intent(world: &mut World, args: &SkillArgs) {
 struct SpawnGameplayProjectile;
 
 impl SkillAction for SpawnGameplayProjectile {
-    fn validate(&self, _args: &SkillArgs, _registry: &SkillRegistry) -> Result<(), SkillError> {
+    fn validate(
+        &self,
+        _args: &RuntimeArgs,
+        _registry: &SkillActionRegistry,
+    ) -> Result<(), SkillError> {
         Ok(())
     }
 
     fn emit(
         &self,
         ctx: &SkillContext,
-        args: &SkillArgs,
+        input: &SkillActionInput,
         out: &mut SkillActionOutput,
     ) -> SkillResult {
-        out.emit_intent(ctx, "spawn_projectile", args.clone())
+        out.emit_intent(ctx, "spawn_projectile", input.args.clone())
     }
 }
 
@@ -1999,17 +2007,21 @@ impl SkillAction for SpawnGameplayProjectile {
 struct SpawnZoneAction;
 
 impl SkillAction for SpawnZoneAction {
-    fn validate(&self, _args: &SkillArgs, _registry: &SkillRegistry) -> Result<(), SkillError> {
+    fn validate(
+        &self,
+        _args: &RuntimeArgs,
+        _registry: &SkillActionRegistry,
+    ) -> Result<(), SkillError> {
         Ok(())
     }
 
     fn emit(
         &self,
         ctx: &SkillContext,
-        args: &SkillArgs,
+        input: &SkillActionInput,
         out: &mut SkillActionOutput,
     ) -> SkillResult {
-        out.emit_intent(ctx, "spawn_zone", args.clone())
+        out.emit_intent(ctx, "spawn_zone", input.args.clone())
     }
 }
 
@@ -2017,17 +2029,21 @@ impl SkillAction for SpawnZoneAction {
 struct AreaDamageAction;
 
 impl SkillAction for AreaDamageAction {
-    fn validate(&self, _args: &SkillArgs, _registry: &SkillRegistry) -> Result<(), SkillError> {
+    fn validate(
+        &self,
+        _args: &RuntimeArgs,
+        _registry: &SkillActionRegistry,
+    ) -> Result<(), SkillError> {
         Ok(())
     }
 
     fn emit(
         &self,
         ctx: &SkillContext,
-        args: &SkillArgs,
+        input: &SkillActionInput,
         out: &mut SkillActionOutput,
     ) -> SkillResult {
-        out.emit_intent(ctx, "area_damage", args.clone())
+        out.emit_intent(ctx, "area_damage", input.args.clone())
     }
 }
 
@@ -2035,17 +2051,21 @@ impl SkillAction for AreaDamageAction {
 struct CombatLogAction;
 
 impl SkillAction for CombatLogAction {
-    fn validate(&self, _args: &SkillArgs, _registry: &SkillRegistry) -> Result<(), SkillError> {
+    fn validate(
+        &self,
+        _args: &RuntimeArgs,
+        _registry: &SkillActionRegistry,
+    ) -> Result<(), SkillError> {
         Ok(())
     }
 
     fn emit(
         &self,
         ctx: &SkillContext,
-        args: &SkillArgs,
+        input: &SkillActionInput,
         out: &mut SkillActionOutput,
     ) -> SkillResult {
-        out.emit_intent(ctx, "combat_log", args.clone())
+        out.emit_intent(ctx, "combat_log", input.args.clone())
     }
 }
 
@@ -2053,17 +2073,21 @@ impl SkillAction for CombatLogAction {
 struct MarkBlastAction;
 
 impl SkillAction for MarkBlastAction {
-    fn validate(&self, _args: &SkillArgs, _registry: &SkillRegistry) -> Result<(), SkillError> {
+    fn validate(
+        &self,
+        _args: &RuntimeArgs,
+        _registry: &SkillActionRegistry,
+    ) -> Result<(), SkillError> {
         Ok(())
     }
 
     fn emit(
         &self,
         ctx: &SkillContext,
-        args: &SkillArgs,
+        input: &SkillActionInput,
         out: &mut SkillActionOutput,
     ) -> SkillResult {
-        out.emit_intent(ctx, "mark_blast", args.clone())
+        out.emit_intent(ctx, "mark_blast", input.args.clone())
     }
 }
 
@@ -2071,17 +2095,21 @@ impl SkillAction for MarkBlastAction {
 struct DetonateMarkedBlastAction;
 
 impl SkillAction for DetonateMarkedBlastAction {
-    fn validate(&self, _args: &SkillArgs, _registry: &SkillRegistry) -> Result<(), SkillError> {
+    fn validate(
+        &self,
+        _args: &RuntimeArgs,
+        _registry: &SkillActionRegistry,
+    ) -> Result<(), SkillError> {
         Ok(())
     }
 
     fn emit(
         &self,
         ctx: &SkillContext,
-        args: &SkillArgs,
+        input: &SkillActionInput,
         out: &mut SkillActionOutput,
     ) -> SkillResult {
-        out.emit_intent(ctx, "detonate_marked_blast", args.clone())
+        out.emit_intent(ctx, "detonate_marked_blast", input.args.clone())
     }
 }
 
@@ -2089,17 +2117,21 @@ impl SkillAction for DetonateMarkedBlastAction {
 struct HealOrShieldAction;
 
 impl SkillAction for HealOrShieldAction {
-    fn validate(&self, _args: &SkillArgs, _registry: &SkillRegistry) -> Result<(), SkillError> {
+    fn validate(
+        &self,
+        _args: &RuntimeArgs,
+        _registry: &SkillActionRegistry,
+    ) -> Result<(), SkillError> {
         Ok(())
     }
 
     fn emit(
         &self,
         ctx: &SkillContext,
-        args: &SkillArgs,
+        input: &SkillActionInput,
         out: &mut SkillActionOutput,
     ) -> SkillResult {
-        out.emit_intent(ctx, "heal_or_shield", args.clone())
+        out.emit_intent(ctx, "heal_or_shield", input.args.clone())
     }
 }
 
@@ -2121,18 +2153,18 @@ fn push_log(world: &mut World, line: String) {
     }
 }
 
-fn number_arg(args: &SkillArgs, key: &str, fallback: f32) -> f32 {
+fn number_arg(args: &RuntimeArgs, key: &str, fallback: f32) -> f32 {
     match args.get(key) {
-        Some(SkillValue::Number(value)) => *value as f32,
+        Some(RuntimeValue::Number(value)) => *value as f32,
         _ => fallback,
     }
 }
 
-fn text_arg(args: &SkillArgs, key: &str) -> Option<String> {
+fn text_arg(args: &RuntimeArgs, key: &str) -> Option<String> {
     match args.get(key) {
-        Some(SkillValue::String(value)) => Some(value.clone()),
-        Some(SkillValue::Number(value)) => Some(value.to_string()),
-        Some(SkillValue::Bool(value)) => Some(value.to_string()),
+        Some(RuntimeValue::String(value)) => Some(value.clone()),
+        Some(RuntimeValue::Number(value)) => Some(value.to_string()),
+        Some(RuntimeValue::Bool(value)) => Some(value.to_string()),
         _ => None,
     }
 }

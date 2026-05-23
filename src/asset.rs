@@ -1,7 +1,8 @@
 use crate::compile::compile_skill;
-use crate::dsl::{SkillCompiled, SkillDef, SkillId};
+use crate::dsl::{SkillDef, SkillId};
 use crate::registry::{SkillError, SkillRegistry};
 use bevy::prelude::{Message, Res, ResMut, Resource};
+pub use bevy_skill_ecs::SkillLibrary;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -29,12 +30,6 @@ pub fn parse_skill_document(source: &str) -> Result<Vec<SkillDef>, SkillError> {
         return Ok(named.skills);
     }
     parse_skill_def(source).map(|skill| vec![skill])
-}
-
-#[derive(Resource, Default, Clone, Debug)]
-pub struct SkillLibrary {
-    compiled: IndexMap<SkillId, SkillCompiled>,
-    invalid: IndexMap<SkillId, SkillError>,
 }
 
 #[derive(Message, Clone, Debug, PartialEq)]
@@ -99,39 +94,6 @@ impl SkillAssetSources {
     }
 }
 
-impl SkillLibrary {
-    pub fn get(&self, id: &SkillId) -> Option<&SkillCompiled> {
-        self.compiled.get(id)
-    }
-
-    pub fn invalid(&self, id: &SkillId) -> Option<&SkillError> {
-        self.invalid.get(id)
-    }
-
-    pub fn insert_compiled(&mut self, skill: SkillCompiled) {
-        self.invalid.shift_remove(&skill.id);
-        self.compiled.insert(skill.id.clone(), skill);
-    }
-
-    pub fn remove(&mut self, id: &SkillId) {
-        self.compiled.shift_remove(id);
-        self.invalid.shift_remove(id);
-    }
-
-    pub fn compiled_ids(&self) -> impl Iterator<Item = &SkillId> {
-        self.compiled.keys()
-    }
-
-    pub fn compiled_len(&self) -> usize {
-        self.compiled.len()
-    }
-
-    pub fn mark_invalid(&mut self, id: SkillId, err: SkillError) {
-        self.compiled.shift_remove(&id);
-        self.invalid.insert(id, err);
-    }
-}
-
 pub fn compile_dirty_skill_assets(
     mut sources: ResMut<SkillAssetSources>,
     registry: Res<SkillRegistry>,
@@ -184,7 +146,7 @@ fn compile_asset_source(
                 updated.push(id);
             }
             Err(err) => {
-                library.mark_invalid(id.clone(), err.clone());
+                library.mark_invalid(id.clone(), err.to_string());
                 return Err(err);
             }
         }

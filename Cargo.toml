@@ -20,7 +20,7 @@ thiserror = "2"
 [features]
 demo_2d = ["bevy/2d"]
 editor = ["demo_2d", "dep:bevy_egui"]
-full_runtime_entities = []
+full_runtime_entities = ["bevy_skill_ecs/full_runtime_entities"]
 
 [dev-dependencies]
 bevy_skill_flow_gameplay = { path = "crates/bevy_skill_flow_gameplay" }

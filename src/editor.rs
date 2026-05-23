@@ -78,7 +78,7 @@ impl SkillEditorState {
                 library.insert_compiled(compiled.clone());
                 self.compiled_cache.insert(compiled.id.clone(), compiled);
             } else if let (Some(id), Some(err)) = (result.skill_id, result.compile_error) {
-                library.mark_invalid(id, err);
+                library.mark_invalid(id, err.to_string());
             }
         }
 
@@ -173,7 +173,7 @@ impl SkillEditorState {
             if self.preview_skill_id.as_ref() == Some(&id) {
                 self.preview_skill_id = None;
             }
-            library.mark_invalid(id, err);
+            library.mark_invalid(id, err.to_string());
         }
     }
 

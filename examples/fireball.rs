@@ -1,4 +1,5 @@
 use bevy::prelude::{App, FixedUpdate, MinimalPlugins};
+use bevy_skill_ecs::SkillActionRegistry;
 use bevy_skill_flow::{
     SkillCastRequest, SkillDslPlugin, SkillIntent, SkillLibrary, SkillRegistry, SkillValue,
     StatModifier, StatOp, compile_skill, parse_skill_def,
@@ -10,7 +11,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.add_plugins((MinimalPlugins, SkillDslPlugin));
     {
         let mut registry = app.world_mut().resource_mut::<SkillRegistry>();
-        registry.register_skill_action("spawn_projectile", SpawnProjectileAction);
         registry.register_skill_modifier(
             "greater_multiple_projectiles",
             StatModifier::new(
@@ -22,6 +22,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         );
     }
+    app.world_mut()
+        .resource_mut::<SkillActionRegistry>()
+        .register_skill_action("spawn_projectile", SpawnProjectileAction);
 
     let ron = r#"
         Skill(

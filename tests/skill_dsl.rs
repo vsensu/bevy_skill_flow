@@ -1,27 +1,63 @@
 use bevy::prelude::{App, FixedUpdate, Messages, Time};
-use bevy_skill_ecs::{
-    ApplyBuffRequest, DamageRequest, DamageResolved, ProjectileHit, SettlementMode, SkillGraph,
-    SkillGraphNodeKind, SkillId as EcsSkillId, SkillRuntimeConfig, SkillValue as EcsSkillValue,
-};
 #[cfg(feature = "full_runtime_entities")]
 use bevy_skill_ecs::{ExecutionOfSkill, SkillChildOf, SkillPayloadOf, SkillRootOf};
+use bevy_skill_ecs::{
+    SettlementMode, SkillActionInput, SkillActionRegistry, SkillEffectRequest, SkillEffectResolved,
+    SkillExpr as EcsSkillExpr, SkillGraph, SkillGraphNodeKind, SkillId as EcsSkillId,
+    SkillParams as RuntimeArgs, SkillRuntimeConfig, SkillValue as EcsSkillValue,
+    eval_skill_expr as eval_runtime_skill_expr,
+};
 #[cfg(feature = "full_runtime_entities")]
 use bevy_skill_flow::SkillRuntimeDebugNode;
 use bevy_skill_flow::{
-    ActiveSkill, ActiveSkillBuff, ModifierDef, SkillAction, SkillActionOutput, SkillArgs,
-    SkillAssetSources, SkillCastRequest, SkillContext, SkillDslPlugin, SkillError,
-    SkillExecutionFailed, SkillExpr, SkillIntent, SkillObserverTrigger, SkillRegistry,
-    SkillResourcePools, SkillResult, SkillRuntimeSignal, SkillValue, StatModifier, compile_skill,
-    eval_skill_expr, parse_skill_def, parse_skill_document,
+    ActiveSkill, ActiveSkillEffect, ModifierDef, SkillAction, SkillActionOutput, SkillAssetSources,
+    SkillCastRequest, SkillContext, SkillDslPlugin, SkillError, SkillExecutionFailed, SkillIntent,
+    SkillObserverTrigger, SkillRegistry, SkillResourcePools, SkillResult, SkillRuntimeSignal,
+    SkillValue, StatModifier, compile_skill, parse_skill_def, parse_skill_document,
 };
 use bevy_skill_flow::{SkillCompiled, SkillLibrary};
-use bevy_skill_flow_gameplay::register_gameplay_primitives;
+use bevy_skill_flow_gameplay::{
+    ApplyBuffRequest, DamageResolved, ProjectileHit, SkillGameplayPlugin,
+    register_gameplay_primitives,
+};
 use std::time::Duration;
 
-fn registry() -> SkillRegistry {
-    let mut registry = SkillRegistry::with_core();
-    register_gameplay_primitives(&mut registry);
-    registry
+struct TestRegistries {
+    compile: SkillRegistry,
+    actions: SkillActionRegistry,
+}
+
+impl std::ops::Deref for TestRegistries {
+    type Target = SkillRegistry;
+
+    fn deref(&self) -> &Self::Target {
+        &self.compile
+    }
+}
+
+impl std::ops::DerefMut for TestRegistries {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.compile
+    }
+}
+
+impl TestRegistries {
+    fn register_skill_action<A>(&mut self, id: impl Into<String>, action: A) -> &mut Self
+    where
+        A: SkillAction,
+    {
+        self.actions.register_skill_action(id, action);
+        self
+    }
+}
+
+fn registry() -> TestRegistries {
+    let mut registries = TestRegistries {
+        compile: SkillRegistry::with_core(),
+        actions: SkillActionRegistry::new(),
+    };
+    register_gameplay_primitives(&mut registries.compile, &mut registries.actions);
+    registries
 }
 
 fn skill_update(app: &mut App) {
@@ -52,15 +88,25 @@ fn parses_single_and_multi_skill_ron() {
 }
 
 #[test]
-fn registry_validation_rejects_unknown_primitives() {
+fn compile_and_runtime_reject_unknown_primitives_at_their_boundary() {
     let skill = parse_skill_def(
         r#"
         Skill(id: "bad", body: Action("missing", {}))
     "#,
     )
     .unwrap();
-    let err = compile_skill(&skill, &registry()).unwrap_err();
-    assert_eq!(err, SkillError::UnknownAction("missing".to_owned()));
+    let compiled = compile_skill(&skill, &registry()).unwrap();
+    let mut app = runtime_app(registry(), compiled);
+    let caster = app.world_mut().spawn_empty().id();
+    app.world_mut().write_message(SkillCastRequest {
+        skill: "bad".into(),
+        caster,
+        target: None,
+    });
+    skill_update(&mut app);
+    let failures = take_failures(&mut app);
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].message.contains("missing"));
 
     let skill = parse_skill_def(
         r#"
@@ -89,20 +135,21 @@ fn expr_eval_supports_paths_math_comparison_and_nullish() {
     ]);
     let ctx = SkillContext::new(&skill, None, 1);
     assert_eq!(
-        eval_skill_expr(
-            &SkillExpr::new("stat.base_damage * stat.spell_damage"),
+        eval_runtime_skill_expr(
+            &EcsSkillExpr::new("stat.base_damage * stat.spell_damage"),
             &ctx
         )
         .unwrap(),
-        SkillValue::Number(60.0)
+        EcsSkillValue::Number(60.0)
     );
     assert_eq!(
-        eval_skill_expr(&SkillExpr::new("stat.projectile_count ?? 1"), &ctx).unwrap(),
-        SkillValue::Number(1.0)
+        eval_runtime_skill_expr(&EcsSkillExpr::new("stat.projectile_count ?? 1"), &ctx).unwrap(),
+        EcsSkillValue::Number(1.0)
     );
     assert_eq!(
-        eval_skill_expr(&SkillExpr::new("stat.base_damage >= 40 && true"), &ctx).unwrap(),
-        SkillValue::Bool(true)
+        eval_runtime_skill_expr(&EcsSkillExpr::new("stat.base_damage >= 40 && true"), &ctx)
+            .unwrap(),
+        EcsSkillValue::Bool(true)
     );
 }
 
@@ -280,8 +327,11 @@ fn execution_sequence_delay_and_on_event_resume() {
     assert_eq!(take_record_intents(&mut app), vec!["after_delay"]);
     assert_eq!(active_skill_count(&mut app), 1);
 
-    let mut payload = SkillArgs::new();
-    payload.insert("target".to_owned(), SkillValue::String("dummy".to_owned()));
+    let mut payload = RuntimeArgs::new();
+    payload.insert(
+        "target".to_owned(),
+        EcsSkillValue::String("dummy".to_owned()),
+    );
     app.world_mut()
         .write_message(SkillRuntimeSignal::new("hit", payload));
     skill_update(&mut app);
@@ -320,7 +370,7 @@ fn emit_nodes_are_bevy_runtime_signals() {
     assert_eq!(events[0].name, "cast_started");
     assert_eq!(
         events[0].payload.get("skill"),
-        Some(&SkillValue::String("emits".to_owned()))
+        Some(&EcsSkillValue::String("emits".to_owned()))
     );
 
     app.world_mut()
@@ -332,11 +382,14 @@ fn emit_nodes_are_bevy_runtime_signals() {
     assert_eq!(events[0].name, "delay_ready");
     assert_eq!(
         events[0].payload.get("step"),
-        Some(&SkillValue::Number(1.0))
+        Some(&EcsSkillValue::Number(1.0))
     );
 
-    let mut payload = SkillArgs::new();
-    payload.insert("target".to_owned(), SkillValue::String("dummy".to_owned()));
+    let mut payload = RuntimeArgs::new();
+    payload.insert(
+        "target".to_owned(),
+        EcsSkillValue::String("dummy".to_owned()),
+    );
     app.world_mut()
         .write_message(SkillRuntimeSignal::new("impact", payload));
     skill_update(&mut app);
@@ -345,7 +398,7 @@ fn emit_nodes_are_bevy_runtime_signals() {
     assert_eq!(events[0].name, "impact_seen");
     assert_eq!(
         events[0].payload.get("target"),
-        Some(&SkillValue::String("dummy".to_owned()))
+        Some(&EcsSkillValue::String("dummy".to_owned()))
     );
 }
 
@@ -553,7 +606,8 @@ fn dirty_skill_asset_sources_hot_reload_new_casts() {
     app.init_resource::<Time>();
     let mut registry = registry();
     registry.register_skill_action("record", RecordAction);
-    *app.world_mut().resource_mut::<SkillRegistry>() = registry;
+    *app.world_mut().resource_mut::<SkillRegistry>() = registry.compile;
+    *app.world_mut().resource_mut::<SkillActionRegistry>() = registry.actions;
 
     app.world_mut()
         .resource_mut::<SkillAssetSources>()
@@ -639,8 +693,11 @@ fn damage_sync_request_and_await_modes_drive_messages_and_resume() {
         request_id: requests[2].request_id,
         execution_id: 1,
         source: Some(caster),
-        target,
-        amount: 13.0,
+        target: Some(target),
+        kind: "damage".to_owned(),
+        payload: [("amount".to_owned(), EcsSkillValue::Number(13.0))]
+            .into_iter()
+            .collect(),
     });
     skill_update(&mut app);
 
@@ -795,13 +852,26 @@ fn fireball_flow_releases_hits_damages_burns_and_explodes() {
         position: Some([3.0, 0.0, 0.0]),
     });
     skill_update(&mut app);
-    assert_eq!(take_damage_requests(&mut app).len(), 1);
-    assert_eq!(take_apply_buff_requests(&mut app).len(), 1);
+    let effect_requests = take_effect_requests(&mut app);
+    assert_eq!(
+        effect_requests
+            .iter()
+            .filter(|request| request.kind == "damage")
+            .count(),
+        1
+    );
+    assert_eq!(
+        effect_requests
+            .iter()
+            .filter(|request| request.kind == "apply_buff")
+            .count(),
+        1
+    );
     assert_eq!(take_record_intents(&mut app), vec!["burning"]);
     assert_eq!(active_skill_count(&mut app), 1);
 
     app.world_mut()
-        .write_message(SkillRuntimeSignal::new("expire", SkillArgs::new()));
+        .write_message(SkillRuntimeSignal::new("expire", RuntimeArgs::new()));
     skill_update(&mut app);
     assert_eq!(take_record_intents(&mut app), vec!["explode"]);
     assert_eq!(active_skill_count(&mut app), 0);
@@ -839,10 +909,10 @@ fn observer_trigger_resumes_waiting_payload() {
         .map(|(entity, _)| entity)
         .unwrap();
 
-    let mut payload = SkillArgs::new();
+    let mut payload = RuntimeArgs::new();
     payload.insert(
         "label".to_owned(),
-        SkillValue::String("observer".to_owned()),
+        EcsSkillValue::String("observer".to_owned()),
     );
     let mut trigger = SkillObserverTrigger::new("observed_hit", payload.clone());
     trigger.skill_entity = Some(skill_entity);
@@ -1030,32 +1100,38 @@ fn bevy_plugin_installs_core_resources() {
 struct RecordAction;
 
 impl SkillAction for RecordAction {
-    fn validate(&self, _args: &SkillArgs, _registry: &SkillRegistry) -> Result<(), SkillError> {
+    fn validate(
+        &self,
+        _args: &RuntimeArgs,
+        _registry: &SkillActionRegistry,
+    ) -> Result<(), SkillError> {
         Ok(())
     }
 
     fn emit(
         &self,
         ctx: &SkillContext,
-        args: &SkillArgs,
+        input: &SkillActionInput,
         out: &mut SkillActionOutput,
     ) -> SkillResult {
+        let args = &input.args;
         let label = match args.get("label") {
-            Some(SkillValue::String(value)) => value.clone(),
-            Some(SkillValue::Number(value)) => value.to_string(),
+            Some(EcsSkillValue::String(value)) => value.clone(),
+            Some(EcsSkillValue::Number(value)) => value.to_string(),
             other => format!("{other:?}"),
         };
-        let mut payload = SkillArgs::new();
-        payload.insert("label".to_owned(), SkillValue::String(label));
+        let mut payload = RuntimeArgs::new();
+        payload.insert("label".to_owned(), EcsSkillValue::String(label));
         out.emit_intent(ctx, "record", payload)
     }
 }
 
-fn runtime_app(registry: SkillRegistry, compiled: SkillCompiled) -> App {
+fn runtime_app(registry: TestRegistries, compiled: SkillCompiled) -> App {
     let mut app = App::new();
-    app.add_plugins(SkillDslPlugin);
+    app.add_plugins((SkillDslPlugin, SkillGameplayPlugin));
     app.init_resource::<Time>();
-    *app.world_mut().resource_mut::<SkillRegistry>() = registry;
+    *app.world_mut().resource_mut::<SkillRegistry>() = registry.compile;
+    *app.world_mut().resource_mut::<SkillActionRegistry>() = registry.actions;
     app.world_mut()
         .resource_mut::<SkillLibrary>()
         .insert_compiled(compiled);
@@ -1068,7 +1144,7 @@ fn take_record_intents(app: &mut App) -> Vec<String> {
         .iter_current_update_messages()
         .filter(|intent| intent.kind == "record")
         .filter_map(|intent| match intent.payload.get("label") {
-            Some(SkillValue::String(value)) => Some(value.clone()),
+            Some(EcsSkillValue::String(value)) => Some(value.clone()),
             _ => None,
         })
         .collect();
@@ -1113,21 +1189,34 @@ fn take_rejections(app: &mut App) -> Vec<bevy_skill_flow::SkillCastRejected> {
     rejected
 }
 
-fn take_damage_requests(app: &mut App) -> Vec<DamageRequest> {
-    let mut messages = app.world_mut().resource_mut::<Messages<DamageRequest>>();
-    let requests = messages.iter_current_update_messages().cloned().collect();
-    messages.clear();
-    requests
+fn take_damage_requests(app: &mut App) -> Vec<SkillEffectRequest> {
+    take_effect_requests(app)
+        .into_iter()
+        .filter(|request| request.kind == "damage")
+        .collect()
 }
 
-fn take_damage_resolved(app: &mut App) -> Vec<DamageResolved> {
-    let mut messages = app.world_mut().resource_mut::<Messages<DamageResolved>>();
-    let resolved = messages.iter_current_update_messages().cloned().collect();
+fn take_damage_resolved(app: &mut App) -> Vec<SkillEffectResolved> {
+    let mut messages = app
+        .world_mut()
+        .resource_mut::<Messages<SkillEffectResolved>>();
+    let resolved = messages
+        .iter_current_update_messages()
+        .filter(|resolved| resolved.kind == "damage")
+        .cloned()
+        .collect();
     messages.clear();
     resolved
 }
 
 fn take_apply_buff_requests(app: &mut App) -> Vec<ApplyBuffRequest> {
+    take_effect_requests(app)
+        .into_iter()
+        .filter(|request| request.kind == "apply_buff")
+        .collect()
+}
+
+fn take_effect_requests(app: &mut App) -> Vec<SkillEffectRequest> {
     let mut messages = app.world_mut().resource_mut::<Messages<ApplyBuffRequest>>();
     let requests = messages.iter_current_update_messages().cloned().collect();
     messages.clear();
@@ -1143,7 +1232,7 @@ fn active_skill_count(app: &mut App) -> usize {
 
 fn active_buff_count(app: &mut App) -> usize {
     app.world_mut()
-        .query::<&ActiveSkillBuff>()
+        .query::<&ActiveSkillEffect>()
         .iter(app.world())
         .count()
 }
@@ -1160,7 +1249,6 @@ fn compiled_with_stats(stats: Vec<(String, SkillValue)>) -> SkillCompiled {
         id: "test".into(),
         tags: Default::default(),
         cast_model: "direct".to_owned(),
-        requirements: Vec::new(),
         graph,
     }
 }

@@ -1,9 +1,10 @@
-use bevy::prelude::{Entity, Event, Message};
 use indexmap::{IndexMap, IndexSet};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub type SkillArgs = IndexMap<String, SkillValue>;
+pub type SkillCompiled = bevy_skill_ecs::SkillCompiled;
 pub type SkillId = bevy_skill_ecs::SkillId;
+pub type SkillRequirement = bevy_skill_ecs::SkillRequirement;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "Skill")]
@@ -24,12 +25,6 @@ pub struct SkillDef {
 
 fn default_cast_model() -> String {
     "direct".to_owned()
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum SkillRequirement {
-    Cost { resource: String, amount: SkillExpr },
-    Cooldown { seconds: SkillExpr },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -126,21 +121,8 @@ impl<'de> Deserialize<'de> for SkillExpr {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct SkillCompiled {
-    pub id: SkillId,
-    pub tags: IndexSet<String>,
-    pub cast_model: String,
-    pub requirements: Vec<SkillRequirement>,
-    pub graph: bevy_skill_ecs::SkillGraph,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct SkillContext {
-    pub skill_entity: Option<Entity>,
-    pub caster: Option<Entity>,
+pub struct SkillCompileContext {
     pub skill_id: SkillId,
-    pub current_target: Option<Entity>,
-    pub source_event: Option<SkillRuntimeSignal>,
     pub vars: IndexMap<String, SkillValue>,
     pub stats: IndexMap<String, SkillValue>,
     pub tags: IndexSet<String>,
@@ -150,19 +132,15 @@ pub struct SkillContext {
     pub step_budget_remaining: u32,
 }
 
-impl SkillContext {
-    pub fn new(compiled: &SkillCompiled, caster: Option<Entity>, execution_id: u64) -> Self {
+impl SkillCompileContext {
+    pub fn new(compiled: &SkillCompiled) -> Self {
         Self {
-            skill_entity: None,
-            caster,
             skill_id: compiled.id.clone(),
-            current_target: None,
-            source_event: None,
             vars: IndexMap::new(),
             stats: stats_from_graph(&compiled.graph),
-            tags: compiled.tags.clone(),
-            rng_seed: execution_id,
-            execution_id,
+            tags: compiled.tags.iter().cloned().collect(),
+            rng_seed: 0,
+            execution_id: 0,
             step_budget: bevy_skill_ecs::SkillRuntimeConfig::default().step_budget,
             step_budget_remaining: bevy_skill_ecs::SkillRuntimeConfig::default().step_budget,
         }
@@ -201,67 +179,4 @@ fn skill_value_from_ecs(value: &bevy_skill_ecs::SkillValue) -> SkillValue {
         bevy_skill_ecs::SkillValue::String(value) => SkillValue::String(value.clone()),
         bevy_skill_ecs::SkillValue::Null => SkillValue::Null,
     }
-}
-
-#[derive(Message, Clone, Debug, PartialEq)]
-pub struct SkillRuntimeSignal {
-    pub name: String,
-    pub payload: SkillArgs,
-    pub execution_id: Option<u64>,
-    pub skill_entity: Option<Entity>,
-    pub caster: Option<Entity>,
-    pub target: Option<Entity>,
-}
-
-#[derive(Event, Clone, Debug, PartialEq)]
-pub struct SkillObserverTrigger {
-    pub name: String,
-    pub payload: SkillArgs,
-    pub execution_id: Option<u64>,
-    pub skill_entity: Option<Entity>,
-    pub caster: Option<Entity>,
-    pub target: Option<Entity>,
-}
-
-impl SkillObserverTrigger {
-    pub fn new(name: impl Into<String>, payload: SkillArgs) -> Self {
-        Self {
-            name: name.into(),
-            payload,
-            execution_id: None,
-            skill_entity: None,
-            caster: None,
-            target: None,
-        }
-    }
-}
-
-impl SkillRuntimeSignal {
-    pub fn new(name: impl Into<String>, payload: SkillArgs) -> Self {
-        Self {
-            name: name.into(),
-            payload,
-            execution_id: None,
-            skill_entity: None,
-            caster: None,
-            target: None,
-        }
-    }
-}
-
-#[derive(Message, Clone, Debug)]
-pub struct SkillExecutionFailed {
-    pub skill: Option<SkillId>,
-    pub execution_id: Option<u64>,
-    pub skill_entity: Option<Entity>,
-    pub message: String,
-}
-
-#[derive(Message, Clone, Debug, PartialEq)]
-pub struct SkillIntent {
-    pub kind: String,
-    pub skill_entity: Entity,
-    pub caster: Entity,
-    pub target: Option<Entity>,
-    pub payload: SkillArgs,
 }

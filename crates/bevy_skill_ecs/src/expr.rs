@@ -1,11 +1,9 @@
-use crate::dsl::{SkillArgs, SkillCompileContext, SkillExpr, SkillSpecialValue, SkillValue};
-use crate::registry::SkillError;
+use crate::{
+    SkillContext, SkillError, SkillExpr, SkillParams as SkillArgs, SkillSpecialValue, SkillValue,
+};
 use indexmap::IndexMap;
 
-pub fn eval_skill_expr(
-    expr: &SkillExpr,
-    ctx: &SkillCompileContext,
-) -> Result<SkillValue, SkillError> {
+pub fn eval_skill_expr(expr: &SkillExpr, ctx: &SkillContext) -> Result<SkillValue, SkillError> {
     let mut parser = Parser::new(&expr.0).map_err(|message| SkillError::Expr {
         expr: expr.0.clone(),
         message,
@@ -23,10 +21,7 @@ pub fn eval_skill_expr(
     Ok(value)
 }
 
-pub fn resolve_value(
-    value: &SkillValue,
-    ctx: &SkillCompileContext,
-) -> Result<SkillValue, SkillError> {
+pub fn resolve_value(value: &SkillValue, ctx: &SkillContext) -> Result<SkillValue, SkillError> {
     match value {
         SkillValue::Special(SkillSpecialValue::Expr(expr)) => {
             eval_skill_expr(&SkillExpr(expr.clone()), ctx)
@@ -53,7 +48,6 @@ pub fn resolve_value(
             .map(|value| resolve_value(value, ctx))
             .collect::<Result<Vec<_>, _>>()
             .map(SkillValue::List),
-        SkillValue::Node(node) => Ok(SkillValue::Node(node.clone())),
         other => Ok(other.clone()),
     }
 }
@@ -76,7 +70,7 @@ fn looks_like_expr(expr: &str) -> bool {
         || expr.contains(" || ")
 }
 
-pub fn resolve_args(args: &SkillArgs, ctx: &SkillCompileContext) -> Result<SkillArgs, SkillError> {
+pub fn resolve_args(args: &SkillArgs, ctx: &SkillContext) -> Result<SkillArgs, SkillError> {
     args.iter()
         .map(|(key, value)| Ok((key.clone(), resolve_value(value, ctx)?)))
         .collect()
@@ -124,11 +118,11 @@ impl Parser {
         }
     }
 
-    fn parse_expr(&mut self, ctx: &SkillCompileContext) -> Result<SkillValue, String> {
+    fn parse_expr(&mut self, ctx: &SkillContext) -> Result<SkillValue, String> {
         self.parse_nullish(ctx)
     }
 
-    fn parse_nullish(&mut self, ctx: &SkillCompileContext) -> Result<SkillValue, String> {
+    fn parse_nullish(&mut self, ctx: &SkillContext) -> Result<SkillValue, String> {
         let mut left = self.parse_or(ctx)?;
         while self.eat_op("??") {
             let right = self.parse_or(ctx)?;
@@ -139,7 +133,7 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_or(&mut self, ctx: &SkillCompileContext) -> Result<SkillValue, String> {
+    fn parse_or(&mut self, ctx: &SkillContext) -> Result<SkillValue, String> {
         let mut left = self.parse_and(ctx)?;
         while self.eat_op("||") {
             let right = self.parse_and(ctx)?;
@@ -148,7 +142,7 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_and(&mut self, ctx: &SkillCompileContext) -> Result<SkillValue, String> {
+    fn parse_and(&mut self, ctx: &SkillContext) -> Result<SkillValue, String> {
         let mut left = self.parse_equality(ctx)?;
         while self.eat_op("&&") {
             let right = self.parse_equality(ctx)?;
@@ -157,7 +151,7 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_equality(&mut self, ctx: &SkillCompileContext) -> Result<SkillValue, String> {
+    fn parse_equality(&mut self, ctx: &SkillContext) -> Result<SkillValue, String> {
         let mut left = self.parse_comparison(ctx)?;
         loop {
             if self.eat_op("==") {
@@ -173,7 +167,7 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_comparison(&mut self, ctx: &SkillCompileContext) -> Result<SkillValue, String> {
+    fn parse_comparison(&mut self, ctx: &SkillContext) -> Result<SkillValue, String> {
         let mut left = self.parse_term(ctx)?;
         loop {
             let op = match self.peek() {
@@ -197,7 +191,7 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_term(&mut self, ctx: &SkillCompileContext) -> Result<SkillValue, String> {
+    fn parse_term(&mut self, ctx: &SkillContext) -> Result<SkillValue, String> {
         let mut left = self.parse_factor(ctx)?;
         loop {
             if self.eat_op("+") {
@@ -213,7 +207,7 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_factor(&mut self, ctx: &SkillCompileContext) -> Result<SkillValue, String> {
+    fn parse_factor(&mut self, ctx: &SkillContext) -> Result<SkillValue, String> {
         let mut left = self.parse_unary(ctx)?;
         loop {
             if self.eat_op("*") {
@@ -229,7 +223,7 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_unary(&mut self, ctx: &SkillCompileContext) -> Result<SkillValue, String> {
+    fn parse_unary(&mut self, ctx: &SkillContext) -> Result<SkillValue, String> {
         if self.eat_op("-") {
             return Ok(SkillValue::Number(-number(&self.parse_unary(ctx)?)?));
         }
@@ -239,7 +233,7 @@ impl Parser {
         self.parse_primary(ctx)
     }
 
-    fn parse_primary(&mut self, ctx: &SkillCompileContext) -> Result<SkillValue, String> {
+    fn parse_primary(&mut self, ctx: &SkillContext) -> Result<SkillValue, String> {
         match self.bump() {
             Some(Token::Number(value)) => Ok(SkillValue::Number(value)),
             Some(Token::Str(value)) => Ok(SkillValue::String(value)),
@@ -359,12 +353,15 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
     Ok(tokens)
 }
 
-fn resolve_path(path: &str, ctx: &SkillCompileContext) -> Option<SkillValue> {
+fn resolve_path(path: &str, ctx: &SkillContext) -> Option<SkillValue> {
     let (root, rest) = path.split_once('.').unwrap_or((path, ""));
     let value = match root {
         "stat" => get_path(&ctx.stats, rest),
         "var" | "vars" => get_path(&ctx.vars, rest),
-        "event" => None,
+        "event" => ctx
+            .source_event
+            .as_ref()
+            .and_then(|event| get_path(&event.payload, rest)),
         "skill" if rest == "id" => Some(SkillValue::String(ctx.skill_id.0.clone())),
         name => ctx
             .vars
@@ -406,6 +403,6 @@ fn truthy(value: &SkillValue) -> bool {
         SkillValue::Null => false,
         SkillValue::List(value) => !value.is_empty(),
         SkillValue::Map(value) => !value.is_empty(),
-        SkillValue::Special(_) | SkillValue::Node(_) => true,
+        SkillValue::Special(_) => true,
     }
 }

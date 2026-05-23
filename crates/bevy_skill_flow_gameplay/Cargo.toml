@@ -5,5 +5,6 @@ edition = "2024"
 
 [dependencies]
 bevy = { version = "0.18.1", default-features = false }
+bevy_skill_ecs = { path = "../bevy_skill_ecs" }
 bevy_skill_flow = { path = "../.." }
 indexmap = "2.7"

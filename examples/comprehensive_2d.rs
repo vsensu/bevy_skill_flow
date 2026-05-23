@@ -1,9 +1,10 @@
 use bevy::prelude::*;
 use bevy::window::WindowResolution;
+use bevy_skill_ecs::{SkillActionInput, SkillActionRegistry, SkillParams as SkillArgs, SkillValue};
 use bevy_skill_flow::{
-    ActiveSkill, SkillAction, SkillActionOutput, SkillArgs, SkillCastRequest, SkillContext,
-    SkillDslPlugin, SkillError, SkillId, SkillIntent, SkillRegistry, SkillResult,
-    SkillRuntimeSignal, SkillValue, StatModifier, StatOp, compile_skill, parse_skill_document,
+    ActiveSkill, SkillAction, SkillActionOutput, SkillCastRequest, SkillContext, SkillDslPlugin,
+    SkillError, SkillId, SkillIntent, SkillRegistry, SkillResult, SkillRuntimeSignal,
+    SkillValue as DslSkillValue, StatModifier, StatOp, compile_skill, parse_skill_document,
 };
 
 const ARENA_HALF: Vec2 = Vec2::new(520.0, 310.0);
@@ -321,30 +322,31 @@ fn setup_scene(mut commands: Commands) {
 
 fn setup_skill_library(
     mut registry: ResMut<SkillRegistry>,
+    mut actions: ResMut<SkillActionRegistry>,
     mut library: ResMut<bevy_skill_flow::SkillLibrary>,
 ) {
-    registry
+    actions
         .register_skill_action("spawn_projectile", SpawnGameplayProjectile)
         .register_skill_action("spawn_zone", SpawnZoneAction)
         .register_skill_action("area_damage", AreaDamageAction)
         .register_skill_action("combat_log", CombatLogAction)
         .register_skill_action("mark_blast", MarkBlastAction)
         .register_skill_action("detonate_marked_blast", DetonateMarkedBlastAction)
-        .register_skill_action("heal_or_shield", HealOrShieldAction)
-        .register_skill_modifier(
-            "fan_out",
-            StatModifier::new(
-                vec!["projectile".to_owned()],
-                vec![
-                    StatOp::Add("projectile_count".to_owned(), SkillValue::Number(4.0)),
-                    StatOp::Set(
-                        "projectile_spread_degrees".to_owned(),
-                        SkillValue::Number(34.0),
-                    ),
-                    StatOp::Mul("projectile_damage".to_owned(), SkillValue::Number(0.68)),
-                ],
-            ),
-        );
+        .register_skill_action("heal_or_shield", HealOrShieldAction);
+    registry.register_skill_modifier(
+        "fan_out",
+        StatModifier::new(
+            vec!["projectile".to_owned()],
+            vec![
+                StatOp::Add("projectile_count".to_owned(), DslSkillValue::Number(4.0)),
+                StatOp::Set(
+                    "projectile_spread_degrees".to_owned(),
+                    DslSkillValue::Number(34.0),
+                ),
+                StatOp::Mul("projectile_damage".to_owned(), DslSkillValue::Number(0.68)),
+            ],
+        ),
+    );
 
     for skill in parse_skill_document(SKILLS_RON).expect("demo skill RON should parse") {
         library.insert_compiled(
@@ -959,17 +961,21 @@ fn mark_blast_intent(world: &mut World, args: &SkillArgs) {
 struct SpawnGameplayProjectile;
 
 impl SkillAction for SpawnGameplayProjectile {
-    fn validate(&self, _args: &SkillArgs, _registry: &SkillRegistry) -> Result<(), SkillError> {
+    fn validate(
+        &self,
+        _args: &SkillArgs,
+        _registry: &SkillActionRegistry,
+    ) -> Result<(), SkillError> {
         Ok(())
     }
 
     fn emit(
         &self,
         ctx: &SkillContext,
-        args: &SkillArgs,
+        input: &SkillActionInput,
         out: &mut SkillActionOutput,
     ) -> SkillResult {
-        out.emit_intent(ctx, "spawn_projectile", args.clone())
+        out.emit_intent(ctx, "spawn_projectile", input.args.clone())
     }
 }
 
@@ -977,17 +983,21 @@ impl SkillAction for SpawnGameplayProjectile {
 struct SpawnZoneAction;
 
 impl SkillAction for SpawnZoneAction {
-    fn validate(&self, _args: &SkillArgs, _registry: &SkillRegistry) -> Result<(), SkillError> {
+    fn validate(
+        &self,
+        _args: &SkillArgs,
+        _registry: &SkillActionRegistry,
+    ) -> Result<(), SkillError> {
         Ok(())
     }
 
     fn emit(
         &self,
         ctx: &SkillContext,
-        args: &SkillArgs,
+        input: &SkillActionInput,
         out: &mut SkillActionOutput,
     ) -> SkillResult {
-        out.emit_intent(ctx, "spawn_zone", args.clone())
+        out.emit_intent(ctx, "spawn_zone", input.args.clone())
     }
 }
 
@@ -995,17 +1005,21 @@ impl SkillAction for SpawnZoneAction {
 struct AreaDamageAction;
 
 impl SkillAction for AreaDamageAction {
-    fn validate(&self, _args: &SkillArgs, _registry: &SkillRegistry) -> Result<(), SkillError> {
+    fn validate(
+        &self,
+        _args: &SkillArgs,
+        _registry: &SkillActionRegistry,
+    ) -> Result<(), SkillError> {
         Ok(())
     }
 
     fn emit(
         &self,
         ctx: &SkillContext,
-        args: &SkillArgs,
+        input: &SkillActionInput,
         out: &mut SkillActionOutput,
     ) -> SkillResult {
-        out.emit_intent(ctx, "area_damage", args.clone())
+        out.emit_intent(ctx, "area_damage", input.args.clone())
     }
 }
 
@@ -1013,17 +1027,21 @@ impl SkillAction for AreaDamageAction {
 struct CombatLogAction;
 
 impl SkillAction for CombatLogAction {
-    fn validate(&self, _args: &SkillArgs, _registry: &SkillRegistry) -> Result<(), SkillError> {
+    fn validate(
+        &self,
+        _args: &SkillArgs,
+        _registry: &SkillActionRegistry,
+    ) -> Result<(), SkillError> {
         Ok(())
     }
 
     fn emit(
         &self,
         ctx: &SkillContext,
-        args: &SkillArgs,
+        input: &SkillActionInput,
         out: &mut SkillActionOutput,
     ) -> SkillResult {
-        out.emit_intent(ctx, "combat_log", args.clone())
+        out.emit_intent(ctx, "combat_log", input.args.clone())
     }
 }
 
@@ -1031,17 +1049,21 @@ impl SkillAction for CombatLogAction {
 struct MarkBlastAction;
 
 impl SkillAction for MarkBlastAction {
-    fn validate(&self, _args: &SkillArgs, _registry: &SkillRegistry) -> Result<(), SkillError> {
+    fn validate(
+        &self,
+        _args: &SkillArgs,
+        _registry: &SkillActionRegistry,
+    ) -> Result<(), SkillError> {
         Ok(())
     }
 
     fn emit(
         &self,
         ctx: &SkillContext,
-        args: &SkillArgs,
+        input: &SkillActionInput,
         out: &mut SkillActionOutput,
     ) -> SkillResult {
-        out.emit_intent(ctx, "mark_blast", args.clone())
+        out.emit_intent(ctx, "mark_blast", input.args.clone())
     }
 }
 
@@ -1049,17 +1071,21 @@ impl SkillAction for MarkBlastAction {
 struct DetonateMarkedBlastAction;
 
 impl SkillAction for DetonateMarkedBlastAction {
-    fn validate(&self, _args: &SkillArgs, _registry: &SkillRegistry) -> Result<(), SkillError> {
+    fn validate(
+        &self,
+        _args: &SkillArgs,
+        _registry: &SkillActionRegistry,
+    ) -> Result<(), SkillError> {
         Ok(())
     }
 
     fn emit(
         &self,
         ctx: &SkillContext,
-        args: &SkillArgs,
+        input: &SkillActionInput,
         out: &mut SkillActionOutput,
     ) -> SkillResult {
-        out.emit_intent(ctx, "detonate_marked_blast", args.clone())
+        out.emit_intent(ctx, "detonate_marked_blast", input.args.clone())
     }
 }
 
@@ -1067,17 +1093,21 @@ impl SkillAction for DetonateMarkedBlastAction {
 struct HealOrShieldAction;
 
 impl SkillAction for HealOrShieldAction {
-    fn validate(&self, _args: &SkillArgs, _registry: &SkillRegistry) -> Result<(), SkillError> {
+    fn validate(
+        &self,
+        _args: &SkillArgs,
+        _registry: &SkillActionRegistry,
+    ) -> Result<(), SkillError> {
         Ok(())
     }
 
     fn emit(
         &self,
         ctx: &SkillContext,
-        args: &SkillArgs,
+        input: &SkillActionInput,
         out: &mut SkillActionOutput,
     ) -> SkillResult {
-        out.emit_intent(ctx, "heal_or_shield", args.clone())
+        out.emit_intent(ctx, "heal_or_shield", input.args.clone())
     }
 }
 
