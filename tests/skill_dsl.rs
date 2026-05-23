@@ -1,14 +1,15 @@
-use bevy::prelude::{App, FixedUpdate, Messages, Time};
-#[cfg(feature = "full_runtime_entities")]
-use bevy_skill_ecs::{ExecutionOfSkill, SkillChildOf, SkillPayloadOf, SkillRootOf};
+use bevy::ecs::relationship::RelationshipTarget;
+use bevy::prelude::{App, FixedUpdate, Messages, Mut, Time};
 use bevy_skill_ecs::{
-    SettlementMode, SkillActionInput, SkillActionRegistry, SkillEffectRequest, SkillEffectResolved,
-    SkillExpr as EcsSkillExpr, SkillGraph, SkillGraphNodeKind, SkillId as EcsSkillId,
-    SkillParams as RuntimeArgs, SkillRuntimeConfig, SkillValue as EcsSkillValue,
-    eval_skill_expr as eval_runtime_skill_expr,
+    CompiledSkill, SettlementMode, SkillActionInput, SkillActionRegistry, SkillChildOf,
+    SkillChildren, SkillEffectRequest, SkillEffectResolved, SkillExpr as EcsSkillExpr, SkillGraph,
+    SkillGraphNodeKind, SkillGraphNodeRef, SkillId as EcsSkillId, SkillNodeOf,
+    SkillParams as RuntimeArgs, SkillPayloadOf, SkillPayloads, SkillRoots, SkillRuntimeConfig,
+    SkillValue as EcsSkillValue, eval_skill_expr as eval_runtime_skill_expr,
+    replace_compiled_skill_world,
 };
 #[cfg(feature = "full_runtime_entities")]
-use bevy_skill_flow::SkillRuntimeDebugNode;
+use bevy_skill_ecs::{ExecutionOfSkill, SkillRootOf};
 use bevy_skill_flow::{
     ActiveSkill, ActiveSkillEffect, ModifierDef, SkillAction, SkillActionOutput, SkillAssetSources,
     SkillCastRequest, SkillContext, SkillDslPlugin, SkillError, SkillExecutionFailed, SkillIntent,
@@ -133,7 +134,13 @@ fn expr_eval_supports_paths_math_comparison_and_nullish() {
         ("base_damage".to_owned(), SkillValue::Number(40.0)),
         ("spell_damage".to_owned(), SkillValue::Number(1.5)),
     ]);
-    let ctx = SkillContext::new(&skill, None, 1);
+    let ctx = SkillContext::new(
+        skill.id.clone(),
+        skill.graph.params.clone(),
+        skill.tags.clone(),
+        None,
+        1,
+    );
     assert_eq!(
         eval_runtime_skill_expr(
             &EcsSkillExpr::new("stat.base_damage * stat.spell_damage"),
@@ -272,6 +279,86 @@ fn flow_ron_compiles_to_ordered_ecs_skill_graph() {
     let hit_order = hit_sequence.children.get("items").unwrap();
     assert_extension(&compiled.graph, hit_order[0], "damage");
     assert_extension(&compiled.graph, hit_order[1], "trace");
+}
+
+#[test]
+fn compiled_skill_materializes_default_entity_relationship_graph() {
+    let skill = parse_skill_def(
+        r#"
+        Skill(
+          id: "relationship_graph",
+          body: Sequence([
+            Action("trace", { "label": "first" }),
+            Action("spawn_projectile", {
+              "prefab": "bolt",
+              "on_hit": On("hit", Action("trace", { "label": "hit" })),
+            }),
+          ]),
+        )
+    "#,
+    )
+    .unwrap();
+    let replacement = parse_skill_def(
+        r#"
+        Skill(id: "relationship_graph", body: Action("trace", { "label": "replacement" }))
+    "#,
+    )
+    .unwrap();
+    let compiled = compile_skill(&skill, &registry()).unwrap();
+    let replacement = compile_skill(&replacement, &registry()).unwrap();
+    let original_node_count = compiled.graph.nodes.len();
+    let mut app = runtime_app(registry(), compiled);
+
+    let skill_entity = app
+        .world()
+        .resource::<SkillLibrary>()
+        .get_entity(&"relationship_graph".into())
+        .unwrap();
+    assert!(app.world().entity(skill_entity).contains::<CompiledSkill>());
+
+    let roots = app
+        .world()
+        .entity(skill_entity)
+        .get::<SkillRoots>()
+        .unwrap();
+    assert_eq!(roots.len(), 1);
+    let root = roots.iter().next().unwrap();
+    assert!(app.world().entity(root).contains::<SkillNodeOf>());
+
+    let root_children = app.world().entity(root).get::<SkillChildren>().unwrap();
+    let mut ordered_children = root_children
+        .iter()
+        .filter_map(|child| {
+            let edge = app.world().entity(child).get::<SkillChildOf>()?;
+            (edge.slot == "items").then_some((edge.order, child))
+        })
+        .collect::<Vec<_>>();
+    ordered_children.sort_by_key(|(order, _)| *order);
+    assert_eq!(ordered_children.len(), 2);
+    assert_eq!(ordered_children[0].0, 0);
+    assert_eq!(ordered_children[1].0, 1);
+
+    let projectile = ordered_children[1].1;
+    let payloads = app
+        .world()
+        .entity(projectile)
+        .get::<SkillPayloads>()
+        .unwrap();
+    let payload_edges = payloads
+        .iter()
+        .filter_map(|payload| app.world().entity(payload).get::<SkillPayloadOf>())
+        .filter(|edge| edge.slot == "on_hit")
+        .count();
+    assert_eq!(payload_edges, 1);
+
+    app.world_mut()
+        .resource_scope(|world, mut library: Mut<SkillLibrary>| {
+            replace_compiled_skill_world(world, &mut library, replacement);
+        });
+
+    assert!(!app.world().entities().contains(skill_entity));
+    let mut node_query = app.world_mut().query::<&SkillGraphNodeRef>();
+    assert!(node_query.iter(app.world()).count() < original_node_count);
 }
 
 #[test]
@@ -650,6 +737,44 @@ fn dirty_skill_asset_sources_hot_reload_new_casts() {
 }
 
 #[test]
+fn invalid_skill_asset_reload_removes_old_compiled_graph() {
+    let mut app = App::new();
+    app.add_plugins(SkillDslPlugin);
+    app.init_resource::<Time>();
+    let mut registry = registry();
+    registry.register_skill_action("record", RecordAction);
+    *app.world_mut().resource_mut::<SkillRegistry>() = registry.compile;
+    *app.world_mut().resource_mut::<SkillActionRegistry>() = registry.actions;
+
+    app.world_mut()
+        .resource_mut::<SkillAssetSources>()
+        .set_source(
+            "memory://invalidating.skill.ron",
+            r#"Skill(id: "invalidating", body: Action("record", { "label": "live" }))"#,
+        );
+    skill_update(&mut app);
+    let old_entity = app
+        .world()
+        .resource::<SkillLibrary>()
+        .get_entity(&"invalidating".into())
+        .unwrap();
+    assert!(app.world().entities().contains(old_entity));
+
+    app.world_mut()
+        .resource_mut::<SkillAssetSources>()
+        .set_source(
+            "memory://invalidating.skill.ron",
+            r#"Skill(id: "invalidating", modifiers: ["missing"], body: Action("record", {}))"#,
+        );
+    skill_update(&mut app);
+
+    let library = app.world().resource::<SkillLibrary>();
+    assert!(library.get_entity(&"invalidating".into()).is_none());
+    assert!(library.invalid(&"invalidating".into()).is_some());
+    assert!(!app.world().entities().contains(old_entity));
+}
+
+#[test]
 fn damage_sync_request_and_await_modes_drive_messages_and_resume() {
     let mut registry = registry();
     registry.register_skill_action("record", RecordAction);
@@ -735,8 +860,10 @@ fn full_runtime_entities_materializes_graph_relationships() {
     });
     skill_update(&mut app);
 
-    let mut debug_query = app.world_mut().query::<&SkillRuntimeDebugNode>();
-    assert_eq!(debug_query.iter(app.world()).count(), graph_node_count);
+    let mut skill_query = app.world_mut().query::<&CompiledSkill>();
+    assert_eq!(skill_query.iter(app.world()).count(), 1);
+    let mut node_query = app.world_mut().query::<&SkillGraphNodeRef>();
+    assert_eq!(node_query.iter(app.world()).count(), graph_node_count);
     assert_eq!(
         app.world_mut()
             .query::<&SkillRootOf>()
@@ -760,10 +887,17 @@ fn full_runtime_entities_materializes_graph_relationships() {
     );
     assert_eq!(
         app.world_mut()
-            .query::<&ExecutionOfSkill>()
+            .query::<&SkillNodeOf>()
             .iter(app.world())
             .count(),
         graph_node_count
+    );
+    assert_eq!(
+        app.world_mut()
+            .query::<&ExecutionOfSkill>()
+            .iter(app.world())
+            .count(),
+        0
     );
 }
 
@@ -1133,8 +1267,9 @@ fn runtime_app(registry: TestRegistries, compiled: SkillCompiled) -> App {
     *app.world_mut().resource_mut::<SkillRegistry>() = registry.compile;
     *app.world_mut().resource_mut::<SkillActionRegistry>() = registry.actions;
     app.world_mut()
-        .resource_mut::<SkillLibrary>()
-        .insert_compiled(compiled);
+        .resource_scope(|world, mut library: Mut<SkillLibrary>| {
+            replace_compiled_skill_world(world, &mut library, compiled);
+        });
     app
 }
 

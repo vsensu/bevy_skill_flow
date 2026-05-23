@@ -1,12 +1,14 @@
 use crate::expr::{eval_skill_expr, resolve_args};
-#[cfg(feature = "full_runtime_entities")]
-use crate::{ExecutionOfSkill, SkillChildOf, SkillPayloadOf, SkillRootOf};
 use crate::{
-    SettlementMode, SkillCastAccepted, SkillCastRejected, SkillCastRequest, SkillCompiled,
-    SkillEffectRequest, SkillEffectResolved, SkillExecutionFinished, SkillExpr, SkillGraph,
-    SkillGraphNodeKind, SkillId, SkillLibrary, SkillNodeId, SkillParams as SkillArgs,
-    SkillRequirement, SkillRuntimeConfig, SkillValue,
+    CompiledSkill, CompiledSkillParams, CompiledSkillTags, Delay, EmitSkillEvent, ExecutionOfSkill,
+    If, Parallel, Repeat, Sequence, SetSkillVar, SettlementMode, SkillCastAccepted,
+    SkillCastRejected, SkillCastRequest, SkillChildOf, SkillChildren, SkillEffectRequest,
+    SkillEffectResolved, SkillExecutionFinished, SkillExpr, SkillExtension, SkillId, SkillLibrary,
+    SkillParams as SkillArgs, SkillPayloadOf, SkillPayloads, SkillRequirement, SkillRequirements,
+    SkillRoots, SkillRuntimeConfig, SkillValue, WaitEvent, WithSkillContext,
 };
+use bevy::ecs::relationship::RelationshipTarget;
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::{
     Commands, Component, Entity, Event, Message, MessageReader, MessageWriter, On, Query, Res,
     ResMut, Resource, Time, Timer, TimerMode,
@@ -53,16 +55,22 @@ pub struct SkillContext {
 }
 
 impl SkillContext {
-    pub fn new(compiled: &SkillCompiled, caster: Option<Entity>, execution_id: u64) -> Self {
+    pub fn new(
+        skill_id: SkillId,
+        stats: SkillArgs,
+        tags: IndexSet<String>,
+        caster: Option<Entity>,
+        execution_id: u64,
+    ) -> Self {
         Self {
             skill_entity: None,
             caster,
-            skill_id: compiled.id.clone(),
+            skill_id,
             current_target: None,
             source_event: None,
             vars: SkillArgs::new(),
-            stats: compiled.graph.params.clone(),
-            tags: compiled.tags.clone(),
+            stats,
+            tags,
             rng_seed: execution_id,
             execution_id,
             step_budget: SkillRuntimeConfig::default().step_budget,
@@ -144,37 +152,21 @@ pub trait SkillAction: Send + Sync + 'static {
     ) -> SkillResult;
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum SkillRuntimeNode {
-    Sequence(Vec<SkillRuntimeNode>),
-    Parallel(Vec<SkillRuntimeNode>),
-    Delay(SkillExpr, Box<SkillRuntimeNode>),
-    Repeat {
-        times: Option<SkillExpr>,
-        duration: Option<SkillExpr>,
-        interval: Option<SkillExpr>,
-        node: Box<SkillRuntimeNode>,
-    },
-    If {
-        condition: SkillExpr,
-        then_node: Box<SkillRuntimeNode>,
-        else_node: Option<Box<SkillRuntimeNode>>,
-    },
-    Let(String, SkillValue, Box<SkillRuntimeNode>),
-    On(String, Box<SkillRuntimeNode>),
-    Emit(String, SkillArgs),
-    Action(String, SkillActionInput),
-}
-
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SkillActionInput {
     pub args: SkillArgs,
-    pub payloads: IndexMap<String, SkillRuntimeNode>,
+    pub payloads: IndexMap<String, Vec<Entity>>,
 }
 
 impl SkillActionInput {
-    pub fn payload(&self, name: &str) -> Option<SkillRuntimeNode> {
-        self.payloads.get(name).cloned()
+    pub fn payload(&self, name: &str) -> Option<Entity> {
+        self.payloads
+            .get(name)
+            .and_then(|payloads| payloads.first().copied())
+    }
+
+    pub fn payloads(&self, name: &str) -> &[Entity] {
+        self.payloads.get(name).map(Vec::as_slice).unwrap_or(&[])
     }
 }
 
@@ -285,6 +277,7 @@ impl SkillCooldowns {
 pub struct ActiveSkill {
     pub skill_id: SkillId,
     pub execution_id: u64,
+    pub compiled_skill: Entity,
     pub caster: Entity,
     pub target: Option<Entity>,
 }
@@ -303,8 +296,22 @@ impl SkillExecutionState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SkillBranch {
     pub wait: SkillWait,
-    pub node: SkillRuntimeNode,
+    pub continuation: Vec<SkillContinuation>,
     pub ctx: SkillContext,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SkillContinuation {
+    Node(Entity),
+    DelayThen { seconds: SkillExpr, node: Entity },
+}
+
+impl SkillContinuation {
+    fn node(&self) -> Entity {
+        match self {
+            Self::Node(node) | Self::DelayThen { node, .. } => *node,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -331,8 +338,8 @@ pub enum SkillActionWait {
 pub struct SkillEffectSpawn {
     pub request: SkillEffectRequest,
     pub duration_seconds: Option<f64>,
-    pub on_add: Option<SkillRuntimeNode>,
-    pub on_remove: Option<SkillRuntimeNode>,
+    pub on_add: Option<Entity>,
+    pub on_remove: Option<Entity>,
     pub ctx: SkillContext,
 }
 
@@ -407,8 +414,8 @@ impl SkillActionOutput {
         target: Option<Entity>,
         payload: SkillArgs,
         duration_seconds: Option<f64>,
-        on_add: Option<SkillRuntimeNode>,
-        on_remove: Option<SkillRuntimeNode>,
+        on_add: Option<Entity>,
+        on_remove: Option<Entity>,
     ) -> Result<u64, SkillError> {
         let request_id = next_protocol_request_id(ctx, self.effect_requests.len() as u64);
         let request = SkillEffectRequest {
@@ -450,16 +457,37 @@ pub struct ActiveSkillEffect {
     pub target: Option<Entity>,
     pub kind: String,
     pub timer: Option<Timer>,
-    pub on_remove: Option<SkillRuntimeNode>,
+    pub on_remove: Option<Entity>,
     pub ctx: SkillContext,
 }
 
-#[cfg(feature = "full_runtime_entities")]
-#[derive(Component, Clone, Debug, PartialEq)]
-pub struct SkillRuntimeDebugNode {
-    pub execution_id: u64,
-    pub graph_node: SkillNodeId,
-    pub kind: String,
+#[derive(SystemParam)]
+pub struct SkillNodeQueries<'w, 's> {
+    compiled: Query<
+        'w,
+        's,
+        (
+            &'static CompiledSkill,
+            &'static CompiledSkillParams,
+            &'static CompiledSkillTags,
+            &'static SkillRequirements,
+            Option<&'static SkillRoots>,
+        ),
+    >,
+    sequence: Query<'w, 's, &'static Sequence>,
+    parallel: Query<'w, 's, &'static Parallel>,
+    delay: Query<'w, 's, &'static Delay>,
+    repeat: Query<'w, 's, &'static Repeat>,
+    if_node: Query<'w, 's, &'static If>,
+    wait_event: Query<'w, 's, &'static WaitEvent>,
+    emit: Query<'w, 's, &'static EmitSkillEvent>,
+    set_var: Query<'w, 's, &'static SetSkillVar>,
+    with_context: Query<'w, 's, &'static WithSkillContext>,
+    extension: Query<'w, 's, &'static SkillExtension>,
+    children: Query<'w, 's, &'static SkillChildren>,
+    child_of: Query<'w, 's, &'static SkillChildOf>,
+    payloads: Query<'w, 's, &'static SkillPayloads>,
+    payload_of: Query<'w, 's, &'static SkillPayloadOf>,
 }
 
 pub fn handle_skill_cast_requests(
@@ -471,9 +499,10 @@ pub fn handle_skill_cast_requests(
     mut resources: ResMut<SkillResourcePools>,
     mut cooldowns: ResMut<SkillCooldowns>,
     mut counters: ResMut<SkillRuntimeCounters>,
+    nodes: SkillNodeQueries,
 ) {
     for request in requests.read() {
-        let Some(compiled) = library.get(&request.skill) else {
+        let Some(compiled_entity) = library.get_entity(&request.skill) else {
             commands.write_message(SkillCastRejected {
                 skill: request.skill.clone(),
                 caster: request.caster,
@@ -482,12 +511,37 @@ pub fn handle_skill_cast_requests(
             });
             continue;
         };
+        let Ok((compiled, params, tags, requirements, roots)) = nodes.compiled.get(compiled_entity)
+        else {
+            commands.write_message(SkillCastRejected {
+                skill: request.skill.clone(),
+                caster: request.caster,
+                target: request.target,
+                message: "compiled skill entity is missing runtime components".to_owned(),
+            });
+            continue;
+        };
+        let Some(root) = root_node_from_roots(roots) else {
+            commands.write_message(SkillCastRejected {
+                skill: request.skill.clone(),
+                caster: request.caster,
+                target: request.target,
+                message: "compiled skill has no materialized root node".to_owned(),
+            });
+            continue;
+        };
 
-        let mut requirement_ctx = SkillContext::new(compiled, Some(request.caster), 0);
-        requirement_ctx.stats = graph_stats(&compiled.graph);
+        let mut requirement_ctx = SkillContext::new(
+            compiled.id.clone(),
+            params.0.clone(),
+            tags.0.clone(),
+            Some(request.caster),
+            0,
+        );
         requirement_ctx.current_target = request.target;
         if let Err(message) = validate_and_pay_requirements(
             compiled,
+            requirements,
             request.caster,
             &requirement_ctx,
             &mut resources,
@@ -503,16 +557,19 @@ pub fn handle_skill_cast_requests(
         }
 
         let execution_id = counters.next_execution_id();
-        let skill_entity = commands.spawn_empty().id();
+        let skill_entity = commands
+            .spawn(ExecutionOfSkill {
+                skill: compiled_entity,
+            })
+            .id();
         let active = ActiveSkill {
             skill_id: compiled.id.clone(),
             execution_id,
+            compiled_skill: compiled_entity,
             caster: request.caster,
             target: request.target,
         };
         commands.entity(skill_entity).insert(active.clone());
-        #[cfg(feature = "full_runtime_entities")]
-        materialize_runtime_entities(&mut commands, skill_entity, execution_id, &compiled.graph);
         commands.write_message(SkillCastAccepted {
             skill: compiled.id.clone(),
             execution_id,
@@ -520,28 +577,21 @@ pub fn handle_skill_cast_requests(
             target: request.target,
         });
 
-        let root = match runtime_node_from_graph(&compiled.graph) {
-            Ok(root) => root,
-            Err(err) => {
-                commands.entity(skill_entity).despawn();
-                commands.write_message(SkillExecutionFailed {
-                    skill: Some(compiled.id.clone()),
-                    execution_id: Some(execution_id),
-                    skill_entity: Some(skill_entity),
-                    message: err.to_string(),
-                });
-                continue;
-            }
-        };
-        let mut ctx = SkillContext::new(compiled, Some(request.caster), execution_id);
-        ctx.stats = graph_stats(&compiled.graph);
+        let mut ctx = SkillContext::new(
+            compiled.id.clone(),
+            params.0.clone(),
+            tags.0.clone(),
+            Some(request.caster),
+            execution_id,
+        );
         ctx.step_budget = config.step_budget;
         ctx.step_budget_remaining = config.step_budget;
         ctx.current_target = request.target;
         ctx.skill_entity = Some(skill_entity);
-        match execute_node(&root, &mut ctx, &registry) {
+        match execute_node(root, &mut ctx, &registry, &nodes) {
             Ok(output) if output.branches.is_empty() => {
-                let output = process_effect_spawns_commands(output, &registry, &mut commands);
+                let output =
+                    process_effect_spawns_commands(output, &registry, &nodes, &mut commands);
                 write_output_commands(output, &mut commands);
                 commands.entity(skill_entity).despawn();
                 commands.write_message(SkillExecutionFinished {
@@ -553,7 +603,8 @@ pub fn handle_skill_cast_requests(
             }
             Ok(output) => {
                 let branches = output.branches.clone();
-                let output = process_effect_spawns_commands(output, &registry, &mut commands);
+                let output =
+                    process_effect_spawns_commands(output, &registry, &nodes, &mut commands);
                 write_output_commands(output, &mut commands);
                 commands
                     .entity(skill_entity)
@@ -588,7 +639,8 @@ pub fn skill_observer_trigger_bridge(trigger: On<SkillObserverTrigger>, mut comm
 }
 
 fn validate_and_pay_requirements(
-    compiled: &SkillCompiled,
+    compiled: &CompiledSkill,
+    requirements: &SkillRequirements,
     caster: Entity,
     ctx: &SkillContext,
     resources: &mut SkillResourcePools,
@@ -597,7 +649,7 @@ fn validate_and_pay_requirements(
     let mut costs = Vec::new();
     let mut cooldown_seconds = None;
 
-    for requirement in &compiled.graph.requirements {
+    for requirement in &requirements.0 {
         match requirement {
             SkillRequirement::Cost { resource, amount } => {
                 let amount = number(
@@ -650,6 +702,7 @@ pub fn tick_skill_delays(
     mut commands: Commands,
     time: Res<Time>,
     registry: Res<SkillActionRegistry>,
+    nodes: SkillNodeQueries,
     mut query: Query<(Entity, &ActiveSkill, &mut SkillExecutionState)>,
     mut finished: MessageWriter<SkillExecutionFinished>,
     mut failed: MessageWriter<SkillExecutionFailed>,
@@ -666,12 +719,18 @@ pub fn tick_skill_delays(
                 SkillWait::Delay(timer) => {
                     timer.tick(time.delta());
                     if timer.is_finished() {
-                        match execute_node(&branch.node, &mut branch.ctx, &registry) {
+                        match execute_continuation(
+                            &branch.continuation,
+                            &mut branch.ctx,
+                            &registry,
+                            &nodes,
+                        ) {
                             Ok(output) => {
                                 next_branches.extend(output.branches.clone());
                                 let output = process_effect_spawns(
                                     output,
                                     &registry,
+                                    &nodes,
                                     &mut commands,
                                     &mut failed,
                                 );
@@ -723,6 +782,7 @@ pub fn resume_skill_signals(
     mut commands: Commands,
     mut signal_reader: MessageReader<SkillRuntimeSignal>,
     registry: Res<SkillActionRegistry>,
+    nodes: SkillNodeQueries,
     mut query: Query<(Entity, &ActiveSkill, &mut SkillExecutionState)>,
     mut finished: MessageWriter<SkillExecutionFinished>,
     mut failed: MessageWriter<SkillExecutionFailed>,
@@ -754,11 +814,17 @@ pub fn resume_skill_signals(
             if let Some(signal) = matching {
                 branch.ctx.source_event = Some(signal.clone());
                 branch.ctx.current_target = signal.target.or(branch.ctx.current_target);
-                match execute_node(&branch.node, &mut branch.ctx, &registry) {
+                match execute_continuation(&branch.continuation, &mut branch.ctx, &registry, &nodes)
+                {
                     Ok(output) => {
                         next_branches.extend(output.branches.clone());
-                        let output =
-                            process_effect_spawns(output, &registry, &mut commands, &mut failed);
+                        let output = process_effect_spawns(
+                            output,
+                            &registry,
+                            &nodes,
+                            &mut commands,
+                            &mut failed,
+                        );
                         write_output_deferred_signals(
                             output,
                             &mut intents,
@@ -801,6 +867,7 @@ pub fn resume_effect_resolved(
     mut commands: Commands,
     mut resolved_reader: MessageReader<SkillEffectResolved>,
     registry: Res<SkillActionRegistry>,
+    nodes: SkillNodeQueries,
     mut query: Query<(Entity, &ActiveSkill, &mut SkillExecutionState)>,
     mut finished: MessageWriter<SkillExecutionFinished>,
     mut failed: MessageWriter<SkillExecutionFailed>,
@@ -826,11 +893,17 @@ pub fn resume_effect_resolved(
 
             if let Some(resolved) = matching {
                 seed_effect_result(&mut branch.ctx, resolved);
-                match execute_node(&branch.node, &mut branch.ctx, &registry) {
+                match execute_continuation(&branch.continuation, &mut branch.ctx, &registry, &nodes)
+                {
                     Ok(output) => {
                         next_branches.extend(output.branches.clone());
-                        let output =
-                            process_effect_spawns(output, &registry, &mut commands, &mut failed);
+                        let output = process_effect_spawns(
+                            output,
+                            &registry,
+                            &nodes,
+                            &mut commands,
+                            &mut failed,
+                        );
                         write_output_deferred_signals(
                             output,
                             &mut intents,
@@ -873,6 +946,7 @@ pub fn tick_skill_effects(
     mut commands: Commands,
     time: Res<Time>,
     registry: Res<SkillActionRegistry>,
+    nodes: SkillNodeQueries,
     mut query: Query<(Entity, &mut ActiveSkillEffect)>,
     mut failed: MessageWriter<SkillExecutionFailed>,
     mut intents: MessageWriter<SkillIntent>,
@@ -890,10 +964,15 @@ pub fn tick_skill_effects(
         }
 
         if let Some(on_remove) = effect.on_remove.clone() {
-            match execute_node(&on_remove, &mut effect.ctx, &registry) {
+            match execute_node(on_remove, &mut effect.ctx, &registry, &nodes) {
                 Ok(output) => {
-                    let output =
-                        process_effect_spawns(output, &registry, &mut commands, &mut failed);
+                    let output = process_effect_spawns(
+                        output,
+                        &registry,
+                        &nodes,
+                        &mut commands,
+                        &mut failed,
+                    );
                     write_output(
                         output,
                         &mut intents,
@@ -916,135 +995,232 @@ pub fn tick_skill_effects(
     }
 }
 
+fn root_node_from_roots(roots: Option<&SkillRoots>) -> Option<Entity> {
+    roots.and_then(|roots| roots.iter().next())
+}
+
+fn node_children(
+    nodes: &SkillNodeQueries,
+    parent: Entity,
+    slot: &str,
+) -> Result<Vec<SkillContinuation>, SkillError> {
+    let Some(children) = nodes.children.get(parent).ok() else {
+        return Ok(Vec::new());
+    };
+    let mut ordered = children
+        .iter()
+        .filter_map(|child| {
+            let relation = nodes.child_of.get(child).ok()?;
+            (relation.parent == parent && relation.slot == slot)
+                .then_some((relation.order, SkillContinuation::Node(child)))
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(order, _)| *order);
+    Ok(ordered.into_iter().map(|(_, child)| child).collect())
+}
+
+fn node_payloads(
+    nodes: &SkillNodeQueries,
+    parent: Entity,
+    slot: &str,
+) -> Result<Vec<SkillContinuation>, SkillError> {
+    let Some(payloads) = nodes.payloads.get(parent).ok() else {
+        return Ok(Vec::new());
+    };
+    let mut ordered = payloads
+        .iter()
+        .filter_map(|payload| {
+            let relation = nodes.payload_of.get(payload).ok()?;
+            (relation.parent == parent && relation.slot == slot)
+                .then_some((relation.order, SkillContinuation::Node(payload)))
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(order, _)| *order);
+    Ok(ordered.into_iter().map(|(_, payload)| payload).collect())
+}
+
+fn node_payload_map(
+    nodes: &SkillNodeQueries,
+    parent: Entity,
+) -> Result<IndexMap<String, Vec<Entity>>, SkillError> {
+    let mut payloads_by_slot: IndexMap<String, Vec<(u32, Entity)>> = IndexMap::new();
+    if let Ok(payloads) = nodes.payloads.get(parent) {
+        for payload in payloads.iter() {
+            let Ok(relation) = nodes.payload_of.get(payload) else {
+                continue;
+            };
+            if relation.parent == parent {
+                payloads_by_slot
+                    .entry(relation.slot.clone())
+                    .or_default()
+                    .push((relation.order, payload));
+            }
+        }
+    }
+    Ok(payloads_by_slot
+        .into_iter()
+        .map(|(slot, mut payloads)| {
+            payloads.sort_by_key(|(order, _)| *order);
+            (
+                slot,
+                payloads
+                    .into_iter()
+                    .map(|(_, payload)| payload)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect())
+}
+
+fn single_child(
+    nodes: &SkillNodeQueries,
+    parent: Entity,
+    slot: &str,
+) -> Result<Entity, SkillError> {
+    let children = node_children(nodes, parent, slot)?;
+    if children.len() != 1 {
+        return Err(SkillError::Runtime(format!(
+            "node `{parent:?}` expected exactly one `{slot}` child, got {}",
+            children.len()
+        )));
+    }
+    Ok(children[0].node())
+}
+
 fn execute_node(
-    node: &SkillRuntimeNode,
+    node: Entity,
     ctx: &mut SkillContext,
     registry: &SkillActionRegistry,
+    nodes: &SkillNodeQueries,
 ) -> Result<ExecutionOutput, SkillError> {
     spend_step(ctx)?;
-    match node {
-        SkillRuntimeNode::Sequence(nodes) => execute_sequence(nodes, ctx, registry),
-        SkillRuntimeNode::Parallel(nodes) => {
-            let mut output = ExecutionOutput::default();
-            for node in nodes {
-                output.extend(execute_node(node, ctx, registry)?);
-            }
-            Ok(output)
+    if nodes.sequence.get(node).is_ok() {
+        return execute_continuation(&node_children(nodes, node, "items")?, ctx, registry, nodes);
+    }
+    if nodes.parallel.get(node).is_ok() {
+        let mut output = ExecutionOutput::default();
+        for child in node_children(nodes, node, "branches")? {
+            output.extend(execute_node(child.node(), ctx, registry, nodes)?);
         }
-        SkillRuntimeNode::Delay(seconds, node) => {
-            let seconds = number(&eval_skill_expr(seconds, ctx)?)?;
-            Ok(ExecutionOutput {
-                branches: vec![SkillBranch {
-                    wait: SkillWait::Delay(Timer::from_seconds(seconds as f32, TimerMode::Once)),
-                    node: (**node).clone(),
-                    ctx: ctx.clone(),
-                }],
-                ..Default::default()
-            })
-        }
-        SkillRuntimeNode::Repeat {
-            times,
-            interval,
-            node,
-            ..
-        } => {
-            let times = match times {
-                Some(expr) => number(&eval_skill_expr(expr, ctx)?)? as usize,
-                None => 1,
-            };
-            let mut sequence = Vec::new();
-            for _ in 0..times {
-                if let Some(interval) = interval {
-                    sequence.push(SkillRuntimeNode::Delay(interval.clone(), node.clone()));
-                } else {
-                    sequence.push((**node).clone());
-                }
-            }
-            execute_node(&SkillRuntimeNode::Sequence(sequence), ctx, registry)
-        }
-        SkillRuntimeNode::If {
-            condition,
-            then_node,
-            else_node,
-        } => {
-            let branch = if truthy(&eval_skill_expr(condition, ctx)?) {
-                Some(then_node.as_ref())
-            } else {
-                else_node.as_deref()
-            };
-            if let Some(branch) = branch {
-                execute_node(branch, ctx, registry)
-            } else {
-                Ok(ExecutionOutput::default())
-            }
-        }
-        SkillRuntimeNode::Let(name, value, node) => {
-            let previous = ctx.vars.insert(name.clone(), value.clone());
-            let result = execute_node(node, ctx, registry);
-            match previous {
-                Some(previous) => ctx.vars.insert(name.clone(), previous),
-                None => ctx.vars.shift_remove(name),
-            };
-            result
-        }
-        SkillRuntimeNode::On(name, node) => Ok(ExecutionOutput {
+        return Ok(output);
+    }
+    if let Ok(delay) = nodes.delay.get(node) {
+        let seconds = number(&eval_skill_expr(&delay.seconds, ctx)?)?;
+        let child = single_child(nodes, node, "then")?;
+        return Ok(ExecutionOutput {
             branches: vec![SkillBranch {
-                wait: SkillWait::Signal(name.clone()),
-                node: (**node).clone(),
+                wait: SkillWait::Delay(Timer::from_seconds(seconds as f32, TimerMode::Once)),
+                continuation: vec![SkillContinuation::Node(child)],
                 ctx: ctx.clone(),
             }],
             ..Default::default()
-        }),
-        SkillRuntimeNode::Emit(name, payload) => {
-            let payload = resolve_args(payload, ctx)?;
-            Ok(ExecutionOutput {
-                signals: vec![SkillRuntimeSignal {
-                    name: name.clone(),
-                    payload,
-                    execution_id: Some(ctx.execution_id),
-                    skill_entity: ctx.skill_entity,
-                    caster: ctx.caster,
-                    target: ctx.current_target,
-                }],
-                ..Default::default()
-            })
-        }
-        SkillRuntimeNode::Action(id, input) => {
-            let action = registry
-                .action(id)
-                .ok_or_else(|| SkillError::UnknownAction(id.clone()))?;
-            let input = SkillActionInput {
-                args: resolve_args(&input.args, ctx)?,
-                payloads: input.payloads.clone(),
-            };
-            let mut output = SkillActionOutput::default();
-            action.emit(ctx, &input, &mut output)?;
-            for (key, value) in output.vars {
-                ctx.vars.insert(key, value);
-            }
-            let branches = output
-                .waits
-                .into_iter()
-                .map(|wait| SkillBranch {
-                    wait: match wait {
-                        SkillActionWait::EffectResolved { request_id } => {
-                            SkillWait::EffectResolved { request_id }
-                        }
-                    },
-                    node: SkillRuntimeNode::Sequence(Vec::new()),
-                    ctx: ctx.clone(),
-                })
-                .collect();
-            Ok(ExecutionOutput {
-                branches,
-                intents: output.intents,
-                effect_requests: output.effect_requests,
-                effect_resolved: output.effect_resolved,
-                effects: output.effects,
-                ..Default::default()
-            })
-        }
+        });
     }
+    if let Ok(repeat) = nodes.repeat.get(node) {
+        let times = match &repeat.times {
+            Some(expr) => number(&eval_skill_expr(expr, ctx)?)? as usize,
+            None => 1,
+        };
+        let body = single_child(nodes, node, "body")?;
+        let mut frames = Vec::with_capacity(times);
+        for _ in 0..times {
+            if let Some(interval) = &repeat.interval {
+                frames.push(SkillContinuation::DelayThen {
+                    seconds: interval.clone(),
+                    node: body,
+                });
+            } else {
+                frames.push(SkillContinuation::Node(body));
+            }
+        }
+        return execute_continuation(&frames, ctx, registry, nodes);
+    }
+    if let Ok(if_node) = nodes.if_node.get(node) {
+        let slot = if truthy(&eval_skill_expr(&if_node.condition, ctx)?) {
+            "then"
+        } else {
+            "else"
+        };
+        let children = node_children(nodes, node, slot)?;
+        return execute_continuation(&children, ctx, registry, nodes);
+    }
+    if let Ok(set_var) = nodes.set_var.get(node) {
+        let child = single_child(nodes, node, "then")?;
+        let previous = ctx.vars.insert(set_var.name.clone(), set_var.value.clone());
+        let result = execute_node(child, ctx, registry, nodes);
+        match previous {
+            Some(previous) => ctx.vars.insert(set_var.name.clone(), previous),
+            None => ctx.vars.shift_remove(&set_var.name),
+        };
+        return result;
+    }
+    if let Ok(wait_event) = nodes.wait_event.get(node) {
+        return Ok(ExecutionOutput {
+            branches: vec![SkillBranch {
+                wait: SkillWait::Signal(wait_event.event.clone()),
+                continuation: node_payloads(nodes, node, &wait_event.event)?,
+                ctx: ctx.clone(),
+            }],
+            ..Default::default()
+        });
+    }
+    if let Ok(emit) = nodes.emit.get(node) {
+        let payload = resolve_args(&emit.payload, ctx)?;
+        return Ok(ExecutionOutput {
+            signals: vec![SkillRuntimeSignal {
+                name: emit.event.clone(),
+                payload,
+                execution_id: Some(ctx.execution_id),
+                skill_entity: ctx.skill_entity,
+                caster: ctx.caster,
+                target: ctx.current_target,
+            }],
+            ..Default::default()
+        });
+    }
+    if nodes.with_context.get(node).is_ok() {
+        let children =
+            node_children(nodes, node, "then").or_else(|_| node_children(nodes, node, "items"))?;
+        return execute_continuation(&children, ctx, registry, nodes);
+    }
+    if let Ok(extension) = nodes.extension.get(node) {
+        let action = registry
+            .action(&extension.constructor)
+            .ok_or_else(|| SkillError::UnknownAction(extension.constructor.clone()))?;
+        let input = SkillActionInput {
+            args: resolve_args(&extension.args, ctx)?,
+            payloads: node_payload_map(nodes, node)?,
+        };
+        let mut output = SkillActionOutput::default();
+        action.emit(ctx, &input, &mut output)?;
+        for (key, value) in output.vars {
+            ctx.vars.insert(key, value);
+        }
+        let branches = output
+            .waits
+            .into_iter()
+            .map(|wait| SkillBranch {
+                wait: match wait {
+                    SkillActionWait::EffectResolved { request_id } => {
+                        SkillWait::EffectResolved { request_id }
+                    }
+                },
+                continuation: Vec::new(),
+                ctx: ctx.clone(),
+            })
+            .collect();
+        return Ok(ExecutionOutput {
+            branches,
+            intents: output.intents,
+            effect_requests: output.effect_requests,
+            effect_resolved: output.effect_resolved,
+            effects: output.effects,
+            ..Default::default()
+        });
+    }
+    Err(SkillError::Runtime(format!(
+        "node entity `{node:?}` has no skill node component"
+    )))
 }
 
 fn spend_step(ctx: &mut SkillContext) -> Result<(), SkillError> {
@@ -1060,22 +1236,36 @@ fn spend_step(ctx: &mut SkillContext) -> Result<(), SkillError> {
     Ok(())
 }
 
-fn execute_sequence(
-    nodes: &[SkillRuntimeNode],
+fn execute_continuation(
+    frames: &[SkillContinuation],
     ctx: &mut SkillContext,
     registry: &SkillActionRegistry,
+    nodes: &SkillNodeQueries,
 ) -> Result<ExecutionOutput, SkillError> {
     let mut output = ExecutionOutput::default();
-    for (index, node) in nodes.iter().enumerate() {
-        let mut child = execute_node(node, ctx, registry)?;
+    for (index, frame) in frames.iter().enumerate() {
+        let mut child = match frame {
+            SkillContinuation::Node(node) => execute_node(*node, ctx, registry, nodes)?,
+            SkillContinuation::DelayThen { seconds, node } => {
+                let seconds = number(&eval_skill_expr(seconds, ctx)?)?;
+                ExecutionOutput {
+                    branches: vec![SkillBranch {
+                        wait: SkillWait::Delay(Timer::from_seconds(
+                            seconds as f32,
+                            TimerMode::Once,
+                        )),
+                        continuation: vec![SkillContinuation::Node(*node)],
+                        ctx: ctx.clone(),
+                    }],
+                    ..Default::default()
+                }
+            }
+        };
         if !child.branches.is_empty() {
-            let rest = nodes[index + 1..].to_vec();
+            let rest = frames[index + 1..].to_vec();
             if !rest.is_empty() {
                 for branch in &mut child.branches {
-                    let mut sequence = Vec::with_capacity(rest.len() + 1);
-                    sequence.push(branch.node.clone());
-                    sequence.extend(rest.clone());
-                    branch.node = SkillRuntimeNode::Sequence(sequence);
+                    branch.continuation.extend(rest.clone());
                 }
             }
             output.extend(child);
@@ -1177,6 +1367,7 @@ impl ExecutionOutput {
 fn process_effect_spawns(
     mut output: ExecutionOutput,
     registry: &SkillActionRegistry,
+    nodes: &SkillNodeQueries,
     commands: &mut Commands,
     failed: &mut MessageWriter<SkillExecutionFailed>,
 ) -> ExecutionOutput {
@@ -1184,7 +1375,7 @@ fn process_effect_spawns(
     while let Some(mut spawn) = effects.pop() {
         if let Some(on_add) = spawn.on_add.take() {
             let mut ctx = spawn.ctx.clone();
-            match execute_node(&on_add, &mut ctx, registry) {
+            match execute_node(on_add, &mut ctx, registry, nodes) {
                 Ok(hook_output) => {
                     output.extend(hook_output);
                     effects.extend(std::mem::take(&mut output.effects));
@@ -1221,13 +1412,14 @@ fn process_effect_spawns(
 fn process_effect_spawns_commands(
     mut output: ExecutionOutput,
     registry: &SkillActionRegistry,
+    nodes: &SkillNodeQueries,
     commands: &mut Commands,
 ) -> ExecutionOutput {
     let mut effects = std::mem::take(&mut output.effects);
     while let Some(mut spawn) = effects.pop() {
         if let Some(on_add) = spawn.on_add.take() {
             let mut ctx = spawn.ctx.clone();
-            match execute_node(&on_add, &mut ctx, registry) {
+            match execute_node(on_add, &mut ctx, registry, nodes) {
                 Ok(hook_output) => {
                     output.extend(hook_output);
                     effects.extend(std::mem::take(&mut output.effects));
@@ -1299,255 +1491,5 @@ fn truthy(value: &SkillValue) -> bool {
         SkillValue::List(value) => !value.is_empty(),
         SkillValue::Map(value) => !value.is_empty(),
         SkillValue::Special(_) => true,
-    }
-}
-
-fn runtime_node_from_graph(graph: &SkillGraph) -> Result<SkillRuntimeNode, SkillError> {
-    let root = graph
-        .root
-        .ok_or_else(|| SkillError::Runtime("skill graph has no root node".to_owned()))?;
-    runtime_node_from_graph_id(graph, root)
-}
-
-fn runtime_node_from_graph_id(
-    graph: &SkillGraph,
-    id: SkillNodeId,
-) -> Result<SkillRuntimeNode, SkillError> {
-    let node = graph.node(id).ok_or_else(|| {
-        SkillError::Runtime(format!("skill graph references missing node `{id:?}`"))
-    })?;
-    match &node.kind {
-        SkillGraphNodeKind::Sequence => Ok(SkillRuntimeNode::Sequence(graph_child_nodes_or_empty(
-            graph, id, "items",
-        )?)),
-        SkillGraphNodeKind::Parallel => Ok(SkillRuntimeNode::Parallel(graph_child_nodes_or_empty(
-            graph, id, "branches",
-        )?)),
-        SkillGraphNodeKind::Delay { seconds } => {
-            let child = single_graph_child(graph, id, "then")?;
-            Ok(SkillRuntimeNode::Delay(
-                SkillExpr::new(seconds.0.clone()),
-                Box::new(child),
-            ))
-        }
-        SkillGraphNodeKind::Repeat {
-            times,
-            duration,
-            interval,
-        } => {
-            let child = single_graph_child(graph, id, "body")?;
-            Ok(SkillRuntimeNode::Repeat {
-                times: times.as_ref().map(|expr| SkillExpr::new(expr.0.clone())),
-                duration: duration.as_ref().map(|expr| SkillExpr::new(expr.0.clone())),
-                interval: interval.as_ref().map(|expr| SkillExpr::new(expr.0.clone())),
-                node: Box::new(child),
-            })
-        }
-        SkillGraphNodeKind::If { condition } => {
-            let then_node = single_graph_child(graph, id, "then")?;
-            let else_node = graph
-                .node(id)
-                .and_then(|node| node.children.get("else"))
-                .and_then(|children| children.first().copied())
-                .map(|child| runtime_node_from_graph_id(graph, child))
-                .transpose()?;
-            Ok(SkillRuntimeNode::If {
-                condition: SkillExpr::new(condition.0.clone()),
-                then_node: Box::new(then_node),
-                else_node: else_node.map(Box::new),
-            })
-        }
-        SkillGraphNodeKind::WaitEvent { event } => {
-            let payload = graph_payload_nodes(graph, id, event)?;
-            Ok(SkillRuntimeNode::On(
-                event.clone(),
-                Box::new(sequence_or_single(payload)),
-            ))
-        }
-        SkillGraphNodeKind::EmitSkillEvent { event, payload } => {
-            Ok(SkillRuntimeNode::Emit(event.clone(), payload.clone()))
-        }
-        SkillGraphNodeKind::SetSkillVar { name, value } => {
-            let child = single_graph_child(graph, id, "then")?;
-            Ok(SkillRuntimeNode::Let(
-                name.clone(),
-                value.clone(),
-                Box::new(child),
-            ))
-        }
-        SkillGraphNodeKind::WithSkillContext => Ok(SkillRuntimeNode::Sequence(
-            graph_child_nodes_or_empty(graph, id, "then")
-                .or_else(|_| graph_child_nodes_or_empty(graph, id, "items"))?,
-        )),
-        SkillGraphNodeKind::Extension { constructor, args } => {
-            let mut input = SkillActionInput {
-                args: args.clone(),
-                payloads: IndexMap::new(),
-            };
-            let graph_node = graph.node(id).expect("validated node");
-            for (slot, payloads) in &graph_node.payloads {
-                let nodes = payloads
-                    .iter()
-                    .map(|payload| runtime_node_from_graph_id(graph, *payload))
-                    .collect::<Result<Vec<_>, _>>()?;
-                input
-                    .payloads
-                    .insert(slot.clone(), sequence_or_single(nodes));
-            }
-            Ok(SkillRuntimeNode::Action(constructor.clone(), input))
-        }
-    }
-}
-
-fn graph_child_nodes(
-    graph: &SkillGraph,
-    id: SkillNodeId,
-    slot: &str,
-) -> Result<Vec<SkillRuntimeNode>, SkillError> {
-    graph
-        .node(id)
-        .and_then(|node| node.children.get(slot))
-        .ok_or_else(|| SkillError::Runtime(format!("node `{id:?}` is missing `{slot}` children")))?
-        .iter()
-        .map(|child| runtime_node_from_graph_id(graph, *child))
-        .collect()
-}
-
-fn graph_child_nodes_or_empty(
-    graph: &SkillGraph,
-    id: SkillNodeId,
-    slot: &str,
-) -> Result<Vec<SkillRuntimeNode>, SkillError> {
-    graph
-        .node(id)
-        .and_then(|node| node.children.get(slot))
-        .map(|children| {
-            children
-                .iter()
-                .map(|child| runtime_node_from_graph_id(graph, *child))
-                .collect()
-        })
-        .unwrap_or_else(|| Ok(Vec::new()))
-}
-
-fn graph_payload_nodes(
-    graph: &SkillGraph,
-    id: SkillNodeId,
-    slot: &str,
-) -> Result<Vec<SkillRuntimeNode>, SkillError> {
-    graph
-        .node(id)
-        .and_then(|node| node.payloads.get(slot))
-        .ok_or_else(|| SkillError::Runtime(format!("node `{id:?}` is missing `{slot}` payload")))?
-        .iter()
-        .map(|payload| runtime_node_from_graph_id(graph, *payload))
-        .collect()
-}
-
-fn single_graph_child(
-    graph: &SkillGraph,
-    id: SkillNodeId,
-    slot: &str,
-) -> Result<SkillRuntimeNode, SkillError> {
-    let mut children = graph_child_nodes(graph, id, slot)?;
-    if children.len() != 1 {
-        return Err(SkillError::Runtime(format!(
-            "node `{id:?}` expected exactly one `{slot}` child, got {}",
-            children.len()
-        )));
-    }
-    Ok(children.remove(0))
-}
-
-fn sequence_or_single(mut nodes: Vec<SkillRuntimeNode>) -> SkillRuntimeNode {
-    if nodes.len() == 1 {
-        nodes.remove(0)
-    } else {
-        SkillRuntimeNode::Sequence(nodes)
-    }
-}
-
-fn graph_stats(graph: &SkillGraph) -> SkillArgs {
-    graph.params.clone()
-}
-
-#[cfg(feature = "full_runtime_entities")]
-fn materialize_runtime_entities(
-    commands: &mut Commands,
-    execution_entity: Entity,
-    execution_id: u64,
-    graph: &SkillGraph,
-) {
-    let mut entities = Vec::with_capacity(graph.nodes.len());
-    for node in &graph.nodes {
-        let entity = commands
-            .spawn((
-                SkillRuntimeDebugNode {
-                    execution_id,
-                    graph_node: node.id,
-                    kind: graph_node_kind_name(&node.kind).to_owned(),
-                },
-                ExecutionOfSkill {
-                    skill: execution_entity,
-                },
-            ))
-            .id();
-        entities.push((node.id, entity));
-    }
-
-    let entity_for = |id: SkillNodeId, entities: &[(SkillNodeId, Entity)]| {
-        entities
-            .iter()
-            .find_map(|(node_id, entity)| (*node_id == id).then_some(*entity))
-    };
-
-    if let Some(root) = graph.root.and_then(|id| entity_for(id, &entities)) {
-        commands.entity(root).insert(SkillRootOf {
-            graph: execution_entity,
-        });
-    }
-
-    for node in &graph.nodes {
-        let Some(parent) = entity_for(node.id, &entities) else {
-            continue;
-        };
-        for (slot, children) in &node.children {
-            for (order, child) in children.iter().enumerate() {
-                if let Some(child_entity) = entity_for(*child, &entities) {
-                    commands.entity(child_entity).insert(SkillChildOf {
-                        parent,
-                        slot: slot.clone(),
-                        order: order as u32,
-                    });
-                }
-            }
-        }
-        for (slot, payloads) in &node.payloads {
-            for (order, payload) in payloads.iter().enumerate() {
-                if let Some(payload_entity) = entity_for(*payload, &entities) {
-                    commands.entity(payload_entity).insert(SkillPayloadOf {
-                        parent,
-                        slot: slot.clone(),
-                        order: order as u32,
-                    });
-                }
-            }
-        }
-    }
-}
-
-#[cfg(feature = "full_runtime_entities")]
-fn graph_node_kind_name(kind: &SkillGraphNodeKind) -> &'static str {
-    match kind {
-        SkillGraphNodeKind::Sequence => "Sequence",
-        SkillGraphNodeKind::Parallel => "Parallel",
-        SkillGraphNodeKind::Delay { .. } => "Delay",
-        SkillGraphNodeKind::Repeat { .. } => "Repeat",
-        SkillGraphNodeKind::If { .. } => "If",
-        SkillGraphNodeKind::WaitEvent { .. } => "WaitEvent",
-        SkillGraphNodeKind::EmitSkillEvent { .. } => "EmitSkillEvent",
-        SkillGraphNodeKind::SetSkillVar { .. } => "SetSkillVar",
-        SkillGraphNodeKind::WithSkillContext => "WithSkillContext",
-        SkillGraphNodeKind::Extension { .. } => "Extension",
     }
 }

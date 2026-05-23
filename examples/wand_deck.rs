@@ -1,5 +1,5 @@
-use bevy::prelude::{App, FixedUpdate, MinimalPlugins};
-use bevy_skill_ecs::SkillActionRegistry;
+use bevy::prelude::{App, FixedUpdate, MinimalPlugins, Mut};
+use bevy_skill_ecs::{SkillActionRegistry, replace_compiled_skill_world};
 use bevy_skill_flow::{
     SkillCastRequest, SkillDslPlugin, SkillIntent, SkillLibrary, SkillRegistry, compile_skill,
     parse_skill_def,
@@ -31,9 +31,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     "#;
 
     let registry = app.world().resource::<SkillRegistry>().clone();
-    let mut library = SkillLibrary::default();
-    library.insert_compiled(compile_skill(&parse_skill_def(ron)?, &registry)?);
-    *app.world_mut().resource_mut::<SkillLibrary>() = library;
+    let compiled = compile_skill(&parse_skill_def(ron)?, &registry)?;
+    app.world_mut()
+        .resource_scope(|world, mut library: Mut<SkillLibrary>| {
+            replace_compiled_skill_world(world, &mut library, compiled);
+        });
 
     let caster = app.world_mut().spawn_empty().id();
     app.world_mut().write_message(SkillCastRequest {

@@ -2,7 +2,7 @@
 
 一个面向 Bevy 游戏的小型数据驱动技能 DSL 与运行时。
 
-`bevy_skill_flow` 是给人编写的 RON DSL 层。它会把技能文件编译成确定顺序的执行计划，以及由 `bevy_skill_ecs` 提供的 ECS-facing `SkillGraph`。具体游戏语义仍然不进入两个核心 crate：投射物、伤害、治疗、增益、卡组施法等概念由宿主游戏通过 action、modifier、cast model 和普通 systems 注册进来。
+`bevy_skill_flow` 是给人编写的 RON DSL 层。它会把技能文件编译成确定顺序的 `SkillGraph` 中间结构，再由 `bevy_skill_ecs` materialize 成 ECS entity graph。具体游戏语义仍然不进入两个核心 crate：投射物、伤害、治疗、增益、卡组施法等概念由宿主游戏通过 action、modifier、cast model 和普通 systems 注册进来。
 
 [English README](README.md)
 
@@ -30,7 +30,7 @@
 
 - `demo_2d`：启用 Bevy 2D 支持，用于交互式 demo。
 - `editor`：启用技能编辑器 demo，并引入 `bevy_egui`。
-- `full_runtime_entities`：把运行时 graph 节点实体化为调试 entities，并附带 root、child、payload 和 execution 关系组件。
+- `full_runtime_entities`：保留为诊断/调试 feature。编译后的技能图默认就是 ECS entities。
 
 核心 crate 对 Bevy 的依赖保持得比较轻：
 
@@ -107,7 +107,7 @@ Skill(
 
 核心不会定义 `spawn_projectile`、`damage` 或 `spell` 的真实含义。RON 编译会把这些名字保留为 graph extension node，ECS runtime 再通过 `SkillActionRegistry` 解析它们。
 
-编译结果是运行时权威的 `SkillGraph`：面向 ECS 的有序技能图，保留 child slot 与 `on_hit`、`on_expire` 等 payload slot。
+编译结果是便于 serde/导入导出的 `SkillGraph` 中间结构。运行时由 `bevy_skill_ecs` 把它 materialize 成 Bevy entities，并通过专用 root、child、payload、execution relationships 执行。
 
 ## 注册游戏语义
 
@@ -134,13 +134,13 @@ sources.set_source("memory://skill.ron", skill_source);
 
 ## 运行时模型
 
-编译后的技能存放在 `bevy_skill_ecs::SkillLibrary` 中。运行时执行属于 `bevy_skill_ecs`，并使用编译后的 `SkillGraph`：
-每次施法请求都会生成一个 `ActiveSkill` entity，按 graph queue 的确定顺序推进，具体玩法效果通过 Bevy 消息交给普通 systems 处理。
+编译后的技能在 `bevy_skill_ecs::SkillLibrary` 中以 `SkillId -> Entity` 建索引。运行时执行属于 `bevy_skill_ecs`，并遍历 materialized entity graph：
+每次施法请求都会生成一个 `ActiveSkill` entity，按 child/payload relationship 的确定顺序推进，具体玩法效果通过 Bevy 消息交给普通 systems 处理。
 
 典型流程：
 
 1. 在 `SkillActionRegistry` 注册 actions，在 `SkillRegistry` 注册 modifiers 和 cast models。
-2. 将 RON 加载到 `SkillLibrary`。
+2. 通过 `SkillAssetSources` 加载 RON，或用 `replace_compiled_skill` materialize 一个 `SkillCompiled`。
 3. 发送 `SkillCastRequest { skill, caster, target }`。
 4. 由 `SkillDslPlugin` 安装的 `SkillEcsPlugin` 创建并 tick `ActiveSkill` entities。
 5. 在普通 gameplay systems 中消费 `SkillIntent` 消息。
@@ -157,9 +157,9 @@ sources.set_source("memory://skill.ron", skill_source);
 - `SkillResourcePools`
 - `SkillCooldowns`
 
-上面的运行时 resources/messages/systems 由 `bevy_skill_ecs` 拥有；`bevy_skill_flow` 只把 RON source 编译进 `SkillLibrary`。
+上面的运行时 resources/messages/systems 由 `bevy_skill_ecs` 拥有；`bevy_skill_flow` 负责把 RON source 编译并 materialize 成 ECS 技能图。
 
-`SkillAssetSources` 是一个轻量热重载 source table。通过 `set_source` 插入或替换 RON 文本后，runtime 会编译 dirty source、更新 `SkillLibrary`，并发出 `SkillAssetReloaded` 或 `SkillAssetReloadFailed`。新的释放会使用新编译出的 `SkillGraph`。
+`SkillAssetSources` 是一个轻量热重载 source table。通过 `set_source` 插入或替换 RON 文本后，runtime 会编译 dirty source、更新 `SkillLibrary`，并发出 `SkillAssetReloaded` 或 `SkillAssetReloadFailed`。新的释放会使用新 materialize 的技能 entity graph。
 
 底层 `bevy_skill_ecs::SkillEcsPlugin` 会安装协议消息与固定运行时阶段：
 

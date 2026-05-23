@@ -5,7 +5,8 @@
 //! host game or a higher-level DSL.
 
 use bevy::prelude::{
-    App, Component, Entity, IntoScheduleConfigs, Message, Plugin, Reflect, Resource, SystemSet,
+    App, Commands, Component, Entity, IntoScheduleConfigs, Message, Plugin, Reflect, Resource,
+    SystemSet, World,
 };
 use indexmap::{IndexMap, IndexSet};
 use serde::{Deserialize, Serialize};
@@ -281,41 +282,191 @@ pub struct SkillCompiled {
 
 #[derive(Resource, Default, Clone, Debug)]
 pub struct SkillLibrary {
-    compiled: IndexMap<SkillId, SkillCompiled>,
+    compiled: IndexMap<SkillId, Entity>,
+    pending: IndexMap<SkillId, SkillCompiled>,
+    orphaned: Vec<Entity>,
     invalid: IndexMap<SkillId, String>,
 }
 
 impl SkillLibrary {
-    pub fn get(&self, id: &SkillId) -> Option<&SkillCompiled> {
-        self.compiled.get(id)
+    pub fn get(&self, id: &SkillId) -> Option<Entity> {
+        self.get_entity(id)
+            .or_else(|| self.pending.contains_key(id).then_some(Entity::PLACEHOLDER))
+    }
+
+    pub fn get_entity(&self, id: &SkillId) -> Option<Entity> {
+        self.compiled.get(id).copied()
     }
 
     pub fn invalid(&self, id: &SkillId) -> Option<&String> {
         self.invalid.get(id)
     }
 
-    pub fn insert_compiled(&mut self, skill: SkillCompiled) {
-        self.invalid.shift_remove(&skill.id);
-        self.compiled.insert(skill.id.clone(), skill);
+    pub fn insert_entity(&mut self, id: SkillId, entity: Entity) -> Option<Entity> {
+        self.invalid.shift_remove(&id);
+        self.pending.shift_remove(&id);
+        self.compiled.insert(id, entity)
     }
 
-    pub fn remove(&mut self, id: &SkillId) {
-        self.compiled.shift_remove(id);
+    pub fn insert_compiled(&mut self, skill: SkillCompiled) {
+        self.invalid.shift_remove(&skill.id);
+        self.pending.insert(skill.id.clone(), skill);
+    }
+
+    pub fn remove(&mut self, id: &SkillId) -> Option<Entity> {
+        let entity = self.detach_entity(id);
+        if let Some(entity) = entity {
+            self.orphaned.push(entity);
+        }
+        entity
+    }
+
+    fn detach_entity(&mut self, id: &SkillId) -> Option<Entity> {
         self.invalid.shift_remove(id);
+        self.pending.shift_remove(id);
+        self.compiled.shift_remove(id)
     }
 
     pub fn compiled_ids(&self) -> impl Iterator<Item = &SkillId> {
-        self.compiled.keys()
+        self.compiled.keys().chain(
+            self.pending
+                .keys()
+                .filter(|id| !self.compiled.contains_key(*id)),
+        )
     }
 
     pub fn compiled_len(&self) -> usize {
         self.compiled.len()
+            + self
+                .pending
+                .keys()
+                .filter(|id| !self.compiled.contains_key(*id))
+                .count()
     }
 
     pub fn mark_invalid(&mut self, id: SkillId, err: impl Into<String>) {
-        self.compiled.shift_remove(&id);
+        if let Some(entity) = self.compiled.shift_remove(&id) {
+            self.orphaned.push(entity);
+        }
+        self.pending.shift_remove(&id);
         self.invalid.insert(id, err.into());
     }
+
+    fn take_pending(&mut self) -> Vec<SkillCompiled> {
+        self.pending.drain(..).map(|(_, skill)| skill).collect()
+    }
+
+    fn take_orphaned(&mut self) -> Vec<Entity> {
+        std::mem::take(&mut self.orphaned)
+    }
+}
+
+pub fn materialize_pending_compiled_skills(
+    mut commands: Commands,
+    mut library: bevy::prelude::ResMut<SkillLibrary>,
+) {
+    for entity in library.take_orphaned() {
+        commands.entity(entity).despawn();
+    }
+    for compiled in library.take_pending() {
+        replace_compiled_skill(&mut commands, &mut library, compiled);
+    }
+}
+
+pub fn spawn_compiled_skill(commands: &mut Commands, compiled: SkillCompiled) -> Entity {
+    let skill_entity = commands
+        .spawn((
+            CompiledSkill {
+                id: compiled.id.clone(),
+                cast_model: compiled.cast_model.clone(),
+            },
+            CompiledSkillTags(compiled.tags.clone()),
+            CompiledSkillParams(compiled.graph.params.clone()),
+            SkillRequirements(compiled.graph.requirements.clone()),
+        ))
+        .id();
+    spawn_compiled_skill_nodes(commands, skill_entity, &compiled.graph);
+    skill_entity
+}
+
+pub fn replace_compiled_skill(
+    commands: &mut Commands,
+    library: &mut SkillLibrary,
+    compiled: SkillCompiled,
+) -> Entity {
+    if let Some(old) = library.detach_entity(&compiled.id) {
+        commands.entity(old).despawn();
+    }
+    let id = compiled.id.clone();
+    let skill_entity = spawn_compiled_skill(commands, compiled);
+    library.insert_entity(id, skill_entity);
+    skill_entity
+}
+
+pub fn despawn_compiled_skill(
+    commands: &mut Commands,
+    library: &mut SkillLibrary,
+    id: &SkillId,
+) -> Option<Entity> {
+    let entity = library.detach_entity(id)?;
+    commands.entity(entity).despawn();
+    Some(entity)
+}
+
+pub fn mark_invalid_skill(
+    commands: &mut Commands,
+    library: &mut SkillLibrary,
+    id: SkillId,
+    err: impl Into<String>,
+) {
+    if let Some(old) = library.detach_entity(&id) {
+        commands.entity(old).despawn();
+    }
+    library.mark_invalid(id, err);
+}
+
+pub fn spawn_compiled_skill_world(world: &mut World, compiled: SkillCompiled) -> Entity {
+    let skill_entity = world
+        .spawn((
+            CompiledSkill {
+                id: compiled.id.clone(),
+                cast_model: compiled.cast_model.clone(),
+            },
+            CompiledSkillTags(compiled.tags.clone()),
+            CompiledSkillParams(compiled.graph.params.clone()),
+            SkillRequirements(compiled.graph.requirements.clone()),
+        ))
+        .id();
+    spawn_compiled_skill_nodes_world(world, skill_entity, &compiled.graph);
+    skill_entity
+}
+
+pub fn replace_compiled_skill_world(
+    world: &mut World,
+    library: &mut SkillLibrary,
+    compiled: SkillCompiled,
+) -> Entity {
+    if let Some(old) = library.detach_entity(&compiled.id)
+        && let Ok(entity) = world.get_entity_mut(old)
+    {
+        entity.despawn();
+    }
+    let id = compiled.id.clone();
+    let skill_entity = spawn_compiled_skill_world(world, compiled);
+    library.insert_entity(id, skill_entity);
+    skill_entity
+}
+
+pub fn despawn_compiled_skill_world(
+    world: &mut World,
+    library: &mut SkillLibrary,
+    id: &SkillId,
+) -> Option<Entity> {
+    let entity = library.detach_entity(id)?;
+    if let Ok(entity_mut) = world.get_entity_mut(entity) {
+        entity_mut.despawn();
+    }
+    Some(entity)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -382,6 +533,242 @@ pub enum SkillGraphError {
     Cycle { at: SkillNodeId },
 }
 
+fn spawn_compiled_skill_nodes(commands: &mut Commands, skill_entity: Entity, graph: &SkillGraph) {
+    let mut entities = Vec::with_capacity(graph.nodes.len());
+    for node in &graph.nodes {
+        let entity = commands
+            .spawn((SkillGraphNodeRef { id: node.id }, SkillNodeOf(skill_entity)))
+            .id();
+        insert_node_kind_commands(commands, entity, &node.kind);
+        entities.push((node.id, entity));
+    }
+
+    insert_graph_relationships_commands(commands, skill_entity, graph, &entities);
+}
+
+fn spawn_compiled_skill_nodes_world(world: &mut World, skill_entity: Entity, graph: &SkillGraph) {
+    let mut entities = Vec::with_capacity(graph.nodes.len());
+    for node in &graph.nodes {
+        let entity = world
+            .spawn((SkillGraphNodeRef { id: node.id }, SkillNodeOf(skill_entity)))
+            .id();
+        insert_node_kind_world(world, entity, &node.kind);
+        entities.push((node.id, entity));
+    }
+
+    insert_graph_relationships_world(world, skill_entity, graph, &entities);
+}
+
+fn insert_node_kind_commands(commands: &mut Commands, entity: Entity, kind: &SkillGraphNodeKind) {
+    match kind {
+        SkillGraphNodeKind::Sequence => {
+            commands.entity(entity).insert(Sequence);
+        }
+        SkillGraphNodeKind::Parallel => {
+            commands.entity(entity).insert(Parallel);
+        }
+        SkillGraphNodeKind::Delay { seconds } => {
+            commands.entity(entity).insert(Delay {
+                seconds: seconds.clone(),
+            });
+        }
+        SkillGraphNodeKind::Repeat {
+            times,
+            duration,
+            interval,
+        } => {
+            commands.entity(entity).insert(Repeat {
+                times: times.clone(),
+                duration: duration.clone(),
+                interval: interval.clone(),
+            });
+        }
+        SkillGraphNodeKind::If { condition } => {
+            commands.entity(entity).insert(If {
+                condition: condition.clone(),
+            });
+        }
+        SkillGraphNodeKind::WaitEvent { event } => {
+            commands.entity(entity).insert(WaitEvent {
+                event: event.clone(),
+            });
+        }
+        SkillGraphNodeKind::EmitSkillEvent { event, payload } => {
+            commands.entity(entity).insert(EmitSkillEvent {
+                event: event.clone(),
+                payload: payload.clone(),
+            });
+        }
+        SkillGraphNodeKind::SetSkillVar { name, value } => {
+            commands.entity(entity).insert(SetSkillVar {
+                name: name.clone(),
+                value: value.clone(),
+            });
+        }
+        SkillGraphNodeKind::WithSkillContext => {
+            commands.entity(entity).insert(WithSkillContext);
+        }
+        SkillGraphNodeKind::Extension { constructor, args } => {
+            commands.entity(entity).insert(SkillExtension {
+                constructor: constructor.clone(),
+                args: args.clone(),
+            });
+        }
+    }
+}
+
+fn insert_node_kind_world(world: &mut World, entity: Entity, kind: &SkillGraphNodeKind) {
+    match kind {
+        SkillGraphNodeKind::Sequence => {
+            world.entity_mut(entity).insert(Sequence);
+        }
+        SkillGraphNodeKind::Parallel => {
+            world.entity_mut(entity).insert(Parallel);
+        }
+        SkillGraphNodeKind::Delay { seconds } => {
+            world.entity_mut(entity).insert(Delay {
+                seconds: seconds.clone(),
+            });
+        }
+        SkillGraphNodeKind::Repeat {
+            times,
+            duration,
+            interval,
+        } => {
+            world.entity_mut(entity).insert(Repeat {
+                times: times.clone(),
+                duration: duration.clone(),
+                interval: interval.clone(),
+            });
+        }
+        SkillGraphNodeKind::If { condition } => {
+            world.entity_mut(entity).insert(If {
+                condition: condition.clone(),
+            });
+        }
+        SkillGraphNodeKind::WaitEvent { event } => {
+            world.entity_mut(entity).insert(WaitEvent {
+                event: event.clone(),
+            });
+        }
+        SkillGraphNodeKind::EmitSkillEvent { event, payload } => {
+            world.entity_mut(entity).insert(EmitSkillEvent {
+                event: event.clone(),
+                payload: payload.clone(),
+            });
+        }
+        SkillGraphNodeKind::SetSkillVar { name, value } => {
+            world.entity_mut(entity).insert(SetSkillVar {
+                name: name.clone(),
+                value: value.clone(),
+            });
+        }
+        SkillGraphNodeKind::WithSkillContext => {
+            world.entity_mut(entity).insert(WithSkillContext);
+        }
+        SkillGraphNodeKind::Extension { constructor, args } => {
+            world.entity_mut(entity).insert(SkillExtension {
+                constructor: constructor.clone(),
+                args: args.clone(),
+            });
+        }
+    }
+}
+
+fn insert_graph_relationships_commands(
+    commands: &mut Commands,
+    skill_entity: Entity,
+    graph: &SkillGraph,
+    entities: &[(SkillNodeId, Entity)],
+) {
+    let entity_for = |id: SkillNodeId| {
+        entities
+            .iter()
+            .find_map(|(node_id, entity)| (*node_id == id).then_some(*entity))
+    };
+
+    if let Some(root) = graph.root.and_then(entity_for) {
+        commands.entity(root).insert(SkillRootOf {
+            graph: skill_entity,
+        });
+    }
+
+    for node in &graph.nodes {
+        let Some(parent) = entity_for(node.id) else {
+            continue;
+        };
+        for (slot, children) in &node.children {
+            for (order, child) in children.iter().enumerate() {
+                if let Some(child_entity) = entity_for(*child) {
+                    commands.entity(child_entity).insert(SkillChildOf {
+                        parent,
+                        slot: slot.clone(),
+                        order: order as u32,
+                    });
+                }
+            }
+        }
+        for (slot, payloads) in &node.payloads {
+            for (order, payload) in payloads.iter().enumerate() {
+                if let Some(payload_entity) = entity_for(*payload) {
+                    commands.entity(payload_entity).insert(SkillPayloadOf {
+                        parent,
+                        slot: slot.clone(),
+                        order: order as u32,
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn insert_graph_relationships_world(
+    world: &mut World,
+    skill_entity: Entity,
+    graph: &SkillGraph,
+    entities: &[(SkillNodeId, Entity)],
+) {
+    let entity_for = |id: SkillNodeId| {
+        entities
+            .iter()
+            .find_map(|(node_id, entity)| (*node_id == id).then_some(*entity))
+    };
+
+    if let Some(root) = graph.root.and_then(entity_for) {
+        world.entity_mut(root).insert(SkillRootOf {
+            graph: skill_entity,
+        });
+    }
+
+    for node in &graph.nodes {
+        let Some(parent) = entity_for(node.id) else {
+            continue;
+        };
+        for (slot, children) in &node.children {
+            for (order, child) in children.iter().enumerate() {
+                if let Some(child_entity) = entity_for(*child) {
+                    world.entity_mut(child_entity).insert(SkillChildOf {
+                        parent,
+                        slot: slot.clone(),
+                        order: order as u32,
+                    });
+                }
+            }
+        }
+        for (slot, payloads) in &node.payloads {
+            for (order, payload) in payloads.iter().enumerate() {
+                if let Some(payload_entity) = entity_for(*payload) {
+                    world.entity_mut(payload_entity).insert(SkillPayloadOf {
+                        parent,
+                        slot: slot.clone(),
+                        order: order as u32,
+                    });
+                }
+            }
+        }
+    }
+}
+
 #[derive(Component, Clone, Debug, Default, Reflect, PartialEq)]
 pub struct Sequence;
 
@@ -413,6 +800,8 @@ pub struct WaitEvent {
 #[derive(Component, Clone, Debug, Reflect, PartialEq)]
 pub struct EmitSkillEvent {
     pub event: String,
+    #[reflect(ignore)]
+    pub payload: SkillParams,
 }
 
 #[derive(Component, Clone, Debug, Reflect, PartialEq)]
@@ -425,29 +814,88 @@ pub struct SetSkillVar {
 #[derive(Component, Clone, Debug, Default, Reflect, PartialEq)]
 pub struct WithSkillContext;
 
+#[derive(Component, Clone, Debug, PartialEq)]
+pub struct CompiledSkill {
+    pub id: SkillId,
+    pub cast_model: String,
+}
+
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct CompiledSkillTags(pub SkillTags);
+
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct CompiledSkillParams(pub SkillParams);
+
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct SkillRequirements(pub Vec<SkillRequirement>);
+
 #[derive(Component, Clone, Debug, Reflect, PartialEq)]
+pub struct SkillGraphNodeRef {
+    pub id: SkillNodeId,
+}
+
+#[derive(Component, Clone, Debug, Reflect, PartialEq)]
+#[relationship(relationship_target = SkillNodesOf)]
+pub struct SkillNodeOf(#[relationship] pub Entity);
+
+#[derive(Component, Clone, Debug, Default, Reflect, PartialEq)]
+#[relationship_target(relationship = SkillNodeOf, linked_spawn)]
+pub struct SkillNodesOf(Vec<Entity>);
+
+#[derive(Component, Clone, Debug, Reflect, PartialEq)]
+#[relationship(relationship_target = SkillRoots)]
 pub struct SkillRootOf {
+    #[relationship]
     pub graph: Entity,
 }
 
 #[derive(Component, Clone, Debug, Reflect, PartialEq)]
+#[relationship_target(relationship = SkillRootOf)]
+pub struct SkillRoots(Vec<Entity>);
+
+#[derive(Component, Clone, Debug, Reflect, PartialEq)]
+#[relationship(relationship_target = SkillChildren)]
 pub struct SkillChildOf {
+    #[relationship]
     pub parent: Entity,
     pub slot: String,
     pub order: u32,
 }
 
 #[derive(Component, Clone, Debug, Reflect, PartialEq)]
+#[relationship_target(relationship = SkillChildOf)]
+pub struct SkillChildren(Vec<Entity>);
+
+#[derive(Component, Clone, Debug, Reflect, PartialEq)]
+#[relationship(relationship_target = SkillPayloads)]
 pub struct SkillPayloadOf {
+    #[relationship]
     pub parent: Entity,
     pub slot: String,
     pub order: u32,
 }
 
 #[derive(Component, Clone, Debug, Reflect, PartialEq)]
+#[relationship_target(relationship = SkillPayloadOf)]
+pub struct SkillPayloads(Vec<Entity>);
+
+#[derive(Component, Clone, Debug, Reflect, PartialEq)]
+pub struct SkillExtension {
+    pub constructor: String,
+    #[reflect(ignore)]
+    pub args: SkillParams,
+}
+
+#[derive(Component, Clone, Debug, Reflect, PartialEq)]
+#[relationship(relationship_target = SkillExecutions)]
 pub struct ExecutionOfSkill {
+    #[relationship]
     pub skill: Entity,
 }
+
+#[derive(Component, Clone, Debug, Reflect, PartialEq)]
+#[relationship_target(relationship = ExecutionOfSkill, linked_spawn)]
+pub struct SkillExecutions(Vec<Entity>);
 
 #[derive(Component, Clone, Debug, Reflect, PartialEq)]
 pub struct ExecutionOwnedBy {
@@ -626,6 +1074,7 @@ impl Plugin for SkillEcsPlugin {
             .add_systems(
                 bevy::prelude::FixedUpdate,
                 (
+                    materialize_pending_compiled_skills.in_set(SkillRuntimeSet::Asset),
                     tick_skill_cooldowns.in_set(SkillRuntimeSet::Request),
                     (handle_skill_cast_requests, tick_skill_delays)
                         .chain()

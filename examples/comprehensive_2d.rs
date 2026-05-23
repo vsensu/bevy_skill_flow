@@ -1,6 +1,9 @@
 use bevy::prelude::*;
 use bevy::window::WindowResolution;
-use bevy_skill_ecs::{SkillActionInput, SkillActionRegistry, SkillParams as SkillArgs, SkillValue};
+use bevy_skill_ecs::{
+    SkillActionInput, SkillActionRegistry, SkillParams as SkillArgs, SkillValue,
+    replace_compiled_skill,
+};
 use bevy_skill_flow::{
     ActiveSkill, SkillAction, SkillActionOutput, SkillCastRequest, SkillContext, SkillDslPlugin,
     SkillError, SkillId, SkillIntent, SkillRegistry, SkillResult, SkillRuntimeSignal,
@@ -321,6 +324,7 @@ fn setup_scene(mut commands: Commands) {
 }
 
 fn setup_skill_library(
+    mut commands: Commands,
     mut registry: ResMut<SkillRegistry>,
     mut actions: ResMut<SkillActionRegistry>,
     mut library: ResMut<bevy_skill_flow::SkillLibrary>,
@@ -349,7 +353,9 @@ fn setup_skill_library(
     );
 
     for skill in parse_skill_document(SKILLS_RON).expect("demo skill RON should parse") {
-        library.insert_compiled(
+        replace_compiled_skill(
+            &mut commands,
+            &mut library,
             compile_skill(&skill, &registry).expect("demo skill RON should compile"),
         );
     }

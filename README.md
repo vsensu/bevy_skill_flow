@@ -3,8 +3,8 @@
 A small, data-driven skill DSL and runtime for Bevy games.
 
 `bevy_skill_flow` is the human-authored RON DSL layer. It compiles skill files
-into deterministic execution plans and an ECS-facing `SkillGraph` supplied by
-`bevy_skill_ecs`. Game semantics stay outside both core crates: host games
+into deterministic `SkillGraph` intermediates that `bevy_skill_ecs`
+materializes into ECS entity graphs. Game semantics stay outside both core crates: host games
 provide concrete actions, modifiers, cast models, and systems such as
 projectiles, damage, buffs, or deck casting.
 
@@ -36,7 +36,7 @@ implementations.
 
 - `demo_2d`: enables Bevy 2D support for the interactive demo.
 - `editor`: enables the skill editor demo and pulls in `bevy_egui`.
-- `full_runtime_entities`: materializes runtime graph nodes as debug entities with root, child, payload, and execution relationship components.
+- `full_runtime_entities`: kept as a diagnostics/debug feature. Compiled skill graphs are ECS entities by default.
 
 The core dependency on Bevy is intentionally minimal:
 
@@ -115,9 +115,9 @@ The core does not decide what `spawn_projectile`, `damage`, or `spell` mean.
 RON compilation preserves those identifiers as graph extension nodes; the ECS
 runtime resolves them through `SkillActionRegistry`.
 
-Compilation produces a runtime-authoritative `SkillGraph`: an ordered
-ECS-facing graph with child slots and payload slots such as `on_hit` or
-`on_expire`.
+Compilation produces a serde-friendly `SkillGraph` intermediate. At runtime,
+`bevy_skill_ecs` materializes that graph into Bevy entities with dedicated
+root, child, payload, and execution relationships.
 
 ## Registering Game Semantics
 
@@ -145,15 +145,16 @@ For your own game, implement these traits:
 
 ## Runtime Model
 
-Compiled skills are stored in `bevy_skill_ecs::SkillLibrary`. Runtime execution
-lives in `bevy_skill_ecs` and uses the compiled `SkillGraph`: each cast request
-spawns an `ActiveSkill` entity, drains the ordered graph queue, and exposes
-gameplay effects as Bevy messages.
+Compiled skills are indexed in `bevy_skill_ecs::SkillLibrary` as
+`SkillId -> Entity`. Runtime execution lives in `bevy_skill_ecs` and traverses
+the materialized entity graph: each cast request spawns an `ActiveSkill` entity,
+follows ordered child/payload relationships, and exposes gameplay effects as
+Bevy messages.
 
 Typical flow:
 
 1. Register actions in `SkillActionRegistry`; register modifiers and cast models in `SkillRegistry`.
-2. Load RON into `SkillLibrary`.
+2. Load RON through `SkillAssetSources`, or materialize a `SkillCompiled` with `replace_compiled_skill`.
 3. Send `SkillCastRequest { skill, caster, target }`.
 4. Let `SkillEcsPlugin` (installed by `SkillDslPlugin`) spawn and tick `ActiveSkill` entities.
 5. Consume `SkillIntent` messages in normal gameplay systems.
@@ -171,12 +172,13 @@ Typical flow:
 - `SkillCooldowns`
 
 The runtime resources/messages/systems above are owned by `bevy_skill_ecs`;
-`bevy_skill_flow` adds RON source compilation into `SkillLibrary`.
+`bevy_skill_flow` adds RON source compilation and materialization into the ECS
+skill graph.
 
 `SkillAssetSources` is a lightweight hot-reload source table. Insert or replace
 RON text with `set_source`; the runtime compiles dirty sources, updates
 `SkillLibrary`, and emits `SkillAssetReloaded` or `SkillAssetReloadFailed`.
-New casts use the newly compiled `SkillGraph`.
+New casts use the newly materialized skill entity graph.
 
 The lower-level `SkillEcsPlugin` from `bevy_skill_ecs` installs the protocol
 messages and fixed runtime sets:

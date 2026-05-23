@@ -1,8 +1,9 @@
 use crate::compile::compile_skill;
 use crate::dsl::{SkillDef, SkillId};
 use crate::registry::{SkillError, SkillRegistry};
-use bevy::prelude::{Message, Res, ResMut, Resource};
+use bevy::prelude::{Commands, Message, Res, ResMut, Resource};
 pub use bevy_skill_ecs::SkillLibrary;
+use bevy_skill_ecs::{despawn_compiled_skill, mark_invalid_skill, replace_compiled_skill};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -95,6 +96,7 @@ impl SkillAssetSources {
 }
 
 pub fn compile_dirty_skill_assets(
+    mut commands: Commands,
     mut sources: ResMut<SkillAssetSources>,
     registry: Res<SkillRegistry>,
     mut library: ResMut<SkillLibrary>,
@@ -106,7 +108,7 @@ pub fn compile_dirty_skill_assets(
         let Some(snapshot) = sources.get(&key).cloned() else {
             continue;
         };
-        let result = compile_asset_source(&snapshot.source, &registry, &mut library);
+        let result = compile_asset_source(&snapshot.source, &registry, &mut commands, &mut library);
         let Some(entry) = sources.sources.get_mut(&key) else {
             continue;
         };
@@ -114,7 +116,7 @@ pub fn compile_dirty_skill_assets(
             Ok(skills) => {
                 for old in &entry.last_skills {
                     if !skills.contains(old) {
-                        library.remove(old);
+                        despawn_compiled_skill(&mut commands, &mut library, old);
                     }
                 }
                 entry.last_skills = skills.clone();
@@ -134,6 +136,7 @@ pub fn compile_dirty_skill_assets(
 fn compile_asset_source(
     source: &str,
     registry: &SkillRegistry,
+    commands: &mut Commands,
     library: &mut SkillLibrary,
 ) -> Result<Vec<SkillId>, SkillError> {
     let defs = parse_skill_document(source)?;
@@ -142,11 +145,11 @@ fn compile_asset_source(
         let id = def.id.clone();
         match compile_skill(&def, registry) {
             Ok(compiled) => {
-                library.insert_compiled(compiled);
+                replace_compiled_skill(commands, library, compiled);
                 updated.push(id);
             }
             Err(err) => {
-                library.mark_invalid(id.clone(), err.to_string());
+                mark_invalid_skill(commands, library, id.clone(), err.to_string());
                 return Err(err);
             }
         }
