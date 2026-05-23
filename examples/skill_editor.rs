@@ -8,10 +8,10 @@ use bevy_egui::{
     EguiContexts, EguiGlobalSettings, EguiPlugin, EguiPrimaryContextPass, EguiTextureHandle,
     EguiUserTextures, PrimaryEguiContext, egui,
 };
-use bevy_skill_dsl::editor::{
+use bevy_skill_flow::editor::{
     SkillEditorConfig, SkillEditorPlugin, SkillEditorState, is_skill_file,
 };
-use bevy_skill_dsl::{
+use bevy_skill_flow::{
     PendingSkillExecutions, SkillAction, SkillArgs, SkillContext, SkillDef, SkillDslPlugin,
     SkillError, SkillExpr, SkillId, SkillLibrary, SkillNode, SkillRegistry, SkillResult,
     SkillRuntimeEvent, SkillSpecialValue, SkillValue, StatModifier, StatOp,
@@ -36,7 +36,7 @@ fn main() {
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
-                    title: "bevy_skill_dsl - skill editor".to_owned(),
+                    title: "bevy_skill_flow - skill editor".to_owned(),
                     resolution: WindowResolution::new(1380, 820),
                     ..default()
                 }),
@@ -44,7 +44,10 @@ fn main() {
             }),
             EguiPlugin::default(),
             SkillDslPlugin,
-            SkillEditorPlugin::new(SkillEditorConfig::default()),
+            SkillEditorPlugin::new(SkillEditorConfig {
+                skills_dir: Path::new("examples/assets/skills").to_path_buf(),
+                ..default()
+            }),
         ))
         .init_resource::<AimWorld>()
         .init_resource::<PreviewArea>()

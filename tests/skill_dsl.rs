@@ -1,22 +1,15 @@
 use bevy::prelude::{App, World};
-use bevy_skill_dsl::examples::{
-    DamageAction, SpawnProjectileAction, SpellAction, TraceAction, WandDeckCastModel,
-};
-use bevy_skill_dsl::{
+use bevy_skill_flow::{
     ModifierDef, PendingSkillExecutions, SkillAction, SkillArgs, SkillContext, SkillError,
     SkillExpr, SkillNode, SkillRegistry, SkillResult, SkillRuntimeEvent, SkillValue, StatModifier,
     compile_skill, eval_skill_expr, parse_skill_def, parse_skill_document,
 };
-use bevy_skill_dsl::{SkillCompiled, SkillDslPlugin, SkillLibrary, SkillPlan};
+use bevy_skill_flow::{SkillCompiled, SkillDslPlugin, SkillLibrary, SkillPlan};
+use bevy_skill_flow_gameplay::register_gameplay_primitives;
 
 fn registry() -> SkillRegistry {
     let mut registry = SkillRegistry::with_core();
-    registry
-        .register_skill_action("trace", TraceAction)
-        .register_skill_action("spawn_projectile", SpawnProjectileAction)
-        .register_skill_action("damage", DamageAction)
-        .register_skill_action("spell", SpellAction)
-        .register_cast_model("wand_deck", WandDeckCastModel);
+    register_gameplay_primitives(&mut registry);
     registry
 }
 
@@ -105,12 +98,15 @@ fn modifier_applies_in_order_and_keeps_original_skill_def_clean() {
         StatModifier::new(
             vec!["projectile".to_owned()],
             vec![
-                bevy_skill_dsl::StatOp::Add("projectile_count".to_owned(), SkillValue::Number(4.0)),
-                bevy_skill_dsl::StatOp::Mul(
+                bevy_skill_flow::StatOp::Add(
+                    "projectile_count".to_owned(),
+                    SkillValue::Number(4.0),
+                ),
+                bevy_skill_flow::StatOp::Mul(
                     "projectile_damage".to_owned(),
                     SkillValue::Number(0.74),
                 ),
-                bevy_skill_dsl::StatOp::Set(
+                bevy_skill_flow::StatOp::Set(
                     "projectile_spread_degrees".to_owned(),
                     SkillValue::Number(35.0),
                 ),
@@ -281,8 +277,11 @@ fn poe_fireball_gmp_compiles_payload_expressions() {
         StatModifier::new(
             vec!["projectile".to_owned()],
             vec![
-                bevy_skill_dsl::StatOp::Add("projectile_count".to_owned(), SkillValue::Number(4.0)),
-                bevy_skill_dsl::StatOp::Mul(
+                bevy_skill_flow::StatOp::Add(
+                    "projectile_count".to_owned(),
+                    SkillValue::Number(4.0),
+                ),
+                bevy_skill_flow::StatOp::Mul(
                     "projectile_damage".to_owned(),
                     SkillValue::Number(0.74),
                 ),
@@ -444,10 +443,10 @@ fn compiled_with_stats(stats: Vec<(String, SkillValue)>) -> SkillCompiled {
 #[cfg(feature = "editor")]
 mod editor_tests {
     use super::registry;
-    use bevy_skill_dsl::editor::{
+    use bevy_skill_flow::editor::{
         SkillEditorConfig, SkillEditorState, next_new_skill_path, serialize_skill_def,
     };
-    use bevy_skill_dsl::{
+    use bevy_skill_flow::{
         SkillArgs, SkillDef, SkillExpr, SkillId, SkillLibrary, SkillNode, SkillValue,
         parse_skill_def,
     };

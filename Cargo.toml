@@ -1,7 +1,11 @@
 [package]
-name = "bevy_skill_dsl"
+name = "bevy_skill_flow"
 version = "0.1.0"
 edition = "2024"
+
+[workspace]
+members = ["crates/bevy_skill_flow_gameplay"]
+resolver = "3"
 
 [dependencies]
 bevy = { version = "0.18.1", default-features = false }
@@ -15,6 +19,9 @@ thiserror = "2"
 [features]
 demo_2d = ["bevy/2d"]
 editor = ["demo_2d", "dep:bevy_egui"]
+
+[dev-dependencies]
+bevy_skill_flow_gameplay = { path = "crates/bevy_skill_flow_gameplay" }
 
 [[example]]
 name = "comprehensive_2d"

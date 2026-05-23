@@ -1355,16 +1355,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "bevy_skill_dsl"
+name = "bevy_skill_flow"
 version = "0.1.0"
 dependencies = [
  "bevy",
  "bevy_egui",
+ "bevy_skill_flow_gameplay",
  "indexmap",
  "ron 0.8.1",
  "serde",
  "smallvec",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bevy_skill_flow_gameplay"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "bevy_skill_flow",
+ "indexmap",
 ]
 
 [[package]]

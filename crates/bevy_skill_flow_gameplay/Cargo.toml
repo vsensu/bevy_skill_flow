@@ -1,0 +1,9 @@
+[package]
+name = "bevy_skill_flow_gameplay"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.18.1", default-features = false }
+bevy_skill_flow = { path = "../.." }
+indexmap = "2.7"

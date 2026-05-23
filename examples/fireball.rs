@@ -1,8 +1,8 @@
 use bevy::prelude::World;
-use bevy_skill_dsl::examples::SpawnProjectileAction;
-use bevy_skill_dsl::{
+use bevy_skill_flow::{
     PendingSkillExecutions, SkillLibrary, SkillRegistry, SkillValue, StatModifier, StatOp,
 };
+use bevy_skill_flow_gameplay::SpawnProjectileAction;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut registry = SkillRegistry::with_core();

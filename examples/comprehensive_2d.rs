@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 use bevy::window::WindowResolution;
-use bevy_skill_dsl::{
+use bevy_skill_flow::{
     PendingSkillExecutions, SkillAction, SkillArgs, SkillContext, SkillDslPlugin, SkillError,
     SkillId, SkillRegistry, SkillResult, SkillRuntimeEvent, SkillValue, StatModifier, StatOp,
 };
@@ -130,7 +130,7 @@ fn main() {
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
-                    title: "bevy_skill_dsl - comprehensive 2D demo".to_owned(),
+                    title: "bevy_skill_flow - comprehensive 2D demo".to_owned(),
                     resolution: WindowResolution::new(1180, 720),
                     ..default()
                 }),
@@ -320,7 +320,7 @@ fn setup_scene(mut commands: Commands) {
 
 fn setup_skill_library(
     mut registry: ResMut<SkillRegistry>,
-    mut library: ResMut<bevy_skill_dsl::SkillLibrary>,
+    mut library: ResMut<bevy_skill_flow::SkillLibrary>,
 ) {
     registry
         .register_skill_action("spawn_projectile", SpawnGameplayProjectile)
@@ -489,7 +489,7 @@ fn handle_skill_input(world: &mut World) {
         )
     };
     let Some(compiled) = world
-        .resource::<bevy_skill_dsl::SkillLibrary>()
+        .resource::<bevy_skill_flow::SkillLibrary>()
         .get(&skill_id)
         .cloned()
     else {

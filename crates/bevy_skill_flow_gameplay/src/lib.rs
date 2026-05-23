@@ -1,7 +1,11 @@
-use crate::dsl::{SkillArgs, SkillContext, SkillDef, SkillNode, SkillPlan, SkillValue};
-use crate::registry::{CastModel, SkillAction, SkillError, SkillRegistry, SkillResult};
-use crate::runtime::trace_arg;
+//! Gameplay primitives that demonstrate how to bind game semantics to
+//! `bevy_skill_flow`.
+
 use bevy::prelude::World;
+use bevy_skill_flow::{
+    CastModel, SkillAction, SkillArgs, SkillContext, SkillDef, SkillError, SkillNode, SkillPlan,
+    SkillRegistry, SkillResult, SkillValue, trace_arg,
+};
 use indexmap::IndexMap;
 
 #[derive(Clone, Debug, Default)]
@@ -143,6 +147,15 @@ impl CastModel for WandDeckCastModel {
             skill.params.clone(),
         ))
     }
+}
+
+pub fn register_gameplay_primitives(registry: &mut SkillRegistry) -> &mut SkillRegistry {
+    registry
+        .register_skill_action("trace", TraceAction)
+        .register_skill_action("spawn_projectile", SpawnProjectileAction)
+        .register_skill_action("damage", DamageAction)
+        .register_skill_action("spell", SpellAction)
+        .register_cast_model("wand_deck", WandDeckCastModel)
 }
 
 fn spell_action(id: &str, args: &SkillArgs, damage_bonus: f64) -> SkillNode {

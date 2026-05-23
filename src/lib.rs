@@ -9,7 +9,6 @@ pub mod compile;
 pub mod dsl;
 #[cfg(feature = "editor")]
 pub mod editor;
-pub mod examples;
 pub mod expr;
 pub mod registry;
 pub mod runtime;

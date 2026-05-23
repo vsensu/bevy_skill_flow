@@ -1,6 +1,6 @@
 use bevy::prelude::World;
-use bevy_skill_dsl::examples::{SpellAction, WandDeckCastModel};
-use bevy_skill_dsl::{PendingSkillExecutions, SkillLibrary, SkillRegistry};
+use bevy_skill_flow::{PendingSkillExecutions, SkillLibrary, SkillRegistry};
+use bevy_skill_flow_gameplay::{SpellAction, WandDeckCastModel};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut registry = SkillRegistry::with_core();
