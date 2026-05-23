@@ -12,7 +12,7 @@ bevy = { version = "0.18.1", default-features = false }
 bevy_skill_ecs = { path = "crates/bevy_skill_ecs" }
 bevy_egui = { version = "0.39.1", optional = true }
 indexmap = { version = "2.7", features = ["serde"] }
-ron = "0.8"
+ron = "0.12"
 serde = { version = "1", features = ["derive"] }
 smallvec = "1.13"
 thiserror = "2"

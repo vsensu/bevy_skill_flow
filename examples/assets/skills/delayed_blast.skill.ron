@@ -7,16 +7,16 @@ Skill(
   },
   body: Sequence([
     Emit("skill_cast", { "label": "Delayed Blast" }),
-    Action("mark_blast", {
-      "radius": Expr("stat.blast_radius"),
-      "delay": 0.7,
-    }),
+    MarkBlast(
+      radius: Expr("stat.blast_radius"),
+      delay: 0.7,
+    ),
     Delay(Expr("0.7"), Parallel([
-      Action("detonate_marked_blast", {
-        "radius": Expr("stat.blast_radius"),
-        "amount": Expr("stat.blast_damage"),
-      }),
-      Action("heal_or_shield", { "amount": 8.0, "mode": "shield" }),
+      DetonateMarkedBlast(
+        radius: Expr("stat.blast_radius"),
+        amount: Expr("stat.blast_damage"),
+      ),
+      HealOrShield(amount: 8.0, mode: Shield),
       Emit("blast_ready", { "label": "blast detonated" }),
     ])),
   ]),

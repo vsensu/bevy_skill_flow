@@ -44,6 +44,8 @@ pub fn compile_skill(
             modifier_ctx.stats = params.clone();
         }
     }
+    let mut lower_ctx = SkillLowerContext::new(registry);
+    let root = lower_ctx.lower_node(root)?;
     validate_node(&root, registry)?;
     let graph = graph_from_parts(&skill.id, &tags, &params, &skill.requirements, &root)?;
     Ok(SkillCompiled {
@@ -59,6 +61,112 @@ pub fn compile_skill_graph(
     registry: &SkillRegistry,
 ) -> Result<SkillGraph, SkillError> {
     compile_skill(skill, registry).map(|compiled| compiled.graph)
+}
+
+pub struct SkillLowerContext<'a> {
+    registry: &'a SkillRegistry,
+}
+
+impl<'a> SkillLowerContext<'a> {
+    pub fn new(registry: &'a SkillRegistry) -> Self {
+        Self { registry }
+    }
+
+    pub fn lower_node(&mut self, node: SkillNode) -> Result<SkillNode, SkillError> {
+        Ok(match node {
+            SkillNode::Sequence(nodes) => SkillNode::Sequence(self.lower_nodes(nodes)?),
+            SkillNode::Parallel(nodes) => SkillNode::Parallel(self.lower_nodes(nodes)?),
+            SkillNode::Delay(seconds, node) => {
+                SkillNode::Delay(seconds, Box::new(self.lower_node(*node)?))
+            }
+            SkillNode::Repeat {
+                times,
+                duration,
+                interval,
+                node,
+            } => SkillNode::Repeat {
+                times,
+                duration,
+                interval,
+                node: Box::new(self.lower_node(*node)?),
+            },
+            SkillNode::If {
+                condition,
+                then_node,
+                else_node,
+            } => SkillNode::If {
+                condition,
+                then_node: Box::new(self.lower_node(*then_node)?),
+                else_node: else_node
+                    .map(|node| self.lower_node(*node).map(Box::new))
+                    .transpose()?,
+            },
+            SkillNode::Let(name, value, node) => SkillNode::Let(
+                name,
+                self.lower_value(value)?,
+                Box::new(self.lower_node(*node)?),
+            ),
+            SkillNode::On(name, node) => SkillNode::On(name, Box::new(self.lower_node(*node)?)),
+            SkillNode::Emit(name, args) => SkillNode::Emit(name, self.lower_args(args)?),
+            SkillNode::Action(id, args) => SkillNode::Action(id, self.lower_args(args)?),
+            SkillNode::Deck(nodes) => SkillNode::Deck(self.lower_nodes(nodes)?),
+            SkillNode::Spell(id, args) => SkillNode::Spell(id, self.lower_args(args)?),
+            SkillNode::Modifier(id, args) => SkillNode::Modifier(id, self.lower_args(args)?),
+            SkillNode::Typed { name, args } => {
+                let node = self
+                    .registry
+                    .dsl_node(&name)
+                    .ok_or_else(|| SkillError::UnknownDslNode(name.clone()))?;
+                let lowered = node.lower(&args, self)?;
+                self.lower_node(lowered)?
+            }
+        })
+    }
+
+    pub fn action(&self, id: impl Into<String>, args: SkillArgs) -> SkillNode {
+        SkillNode::Action(id.into(), args)
+    }
+
+    pub fn payload_arg(
+        &mut self,
+        name: impl Into<String>,
+        node: SkillNode,
+    ) -> Result<(String, SkillValue), SkillError> {
+        Ok((
+            name.into(),
+            SkillValue::Node(Box::new(self.lower_node(node)?)),
+        ))
+    }
+
+    fn lower_nodes(&mut self, nodes: Vec<SkillNode>) -> Result<Vec<SkillNode>, SkillError> {
+        nodes
+            .into_iter()
+            .map(|node| self.lower_node(node))
+            .collect()
+    }
+
+    fn lower_args(&mut self, args: SkillArgs) -> Result<SkillArgs, SkillError> {
+        args.into_iter()
+            .map(|(key, value)| Ok((key, self.lower_value(value)?)))
+            .collect()
+    }
+
+    fn lower_value(&mut self, value: SkillValue) -> Result<SkillValue, SkillError> {
+        Ok(match value {
+            SkillValue::Map(map) => SkillValue::Map(
+                map.into_iter()
+                    .map(|(key, value)| Ok((key, self.lower_value(value)?)))
+                    .collect::<Result<_, SkillError>>()?,
+            ),
+            SkillValue::List(list) => SkillValue::List(
+                list.into_iter()
+                    .map(|value| self.lower_value(value))
+                    .collect::<Result<_, SkillError>>()?,
+            ),
+            SkillValue::Node(node) => SkillValue::Node(Box::new(self.lower_node(*node)?)),
+            other => other,
+        })
+    }
 }
 
 fn graph_from_parts(
@@ -215,9 +323,12 @@ fn append_graph_node(node: &SkillNode, graph: &mut SkillGraph) -> Result<SkillNo
             };
             Ok(graph_id)
         }
-        SkillNode::Deck(_) | SkillNode::Spell(_, _) | SkillNode::Modifier(_, _) => Err(
-            SkillError::Runtime("extension node remained after cast model compilation".to_owned()),
-        ),
+        SkillNode::Deck(_)
+        | SkillNode::Spell(_, _)
+        | SkillNode::Modifier(_, _)
+        | SkillNode::Typed { .. } => Err(SkillError::Runtime(
+            "extension node remained after cast model compilation".to_owned(),
+        )),
     }
 }
 
@@ -356,7 +467,10 @@ pub fn validate_node(node: &SkillNode, registry: &SkillRegistry) -> Result<(), S
             let _ = id;
             validate_values(args.values())?;
         }
-        SkillNode::Deck(_) | SkillNode::Spell(_, _) | SkillNode::Modifier(_, _) => {
+        SkillNode::Deck(_)
+        | SkillNode::Spell(_, _)
+        | SkillNode::Modifier(_, _)
+        | SkillNode::Typed { .. } => {
             return Err(SkillError::Runtime(
                 "extension node remained after cast model compilation".to_owned(),
             ));

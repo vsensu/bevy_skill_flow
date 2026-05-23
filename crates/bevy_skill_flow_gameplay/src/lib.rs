@@ -9,13 +9,14 @@ use bevy_skill_ecs::{
     SkillParams as SkillArgs, SkillResult, SkillValue,
 };
 use bevy_skill_flow::{
-    CastModel, SkillArgs as DslArgs, SkillDef, SkillError, SkillNode, SkillRegistry,
-    SkillValue as DslValue,
+    CastModel, SkillArgs as DslArgs, SkillDef, SkillDslNode, SkillError, SkillLowerContext,
+    SkillNode, SkillRegistry, SkillValue as DslValue,
 };
 use bevy_skill_flow::{
     SettlementMode, SkillEffectRequest, SkillEffectResolved, SkillRuntimeSet, SkillRuntimeSignal,
 };
 use indexmap::IndexMap;
+use serde::{Deserialize, Deserializer};
 
 pub type DamageRequest = SkillEffectRequest;
 pub type DamageResolved = SkillEffectResolved;
@@ -329,6 +330,104 @@ impl CastModel for WandDeckCastModel {
     }
 }
 
+pub struct TraceDslNode;
+
+#[derive(Deserialize)]
+pub struct TraceDslArgs {
+    label: String,
+}
+
+impl SkillDslNode for TraceDslNode {
+    const NAME: &'static str = "Trace";
+    type Args = TraceDslArgs;
+
+    fn lower(args: Self::Args, ctx: &mut SkillLowerContext<'_>) -> Result<SkillNode, SkillError> {
+        let mut action_args = DslArgs::new();
+        action_args.insert("label".to_owned(), DslValue::String(args.label));
+        Ok(ctx.action("trace", action_args))
+    }
+}
+
+pub struct DamageDslNode;
+
+#[derive(Deserialize)]
+pub struct DamageDslArgs {
+    amount: DslValue,
+    #[serde(default = "default_damage_mode")]
+    mode: SettlementMode,
+}
+
+impl SkillDslNode for DamageDslNode {
+    const NAME: &'static str = "Damage";
+    type Args = DamageDslArgs;
+
+    fn lower(args: Self::Args, ctx: &mut SkillLowerContext<'_>) -> Result<SkillNode, SkillError> {
+        let mut action_args = DslArgs::new();
+        action_args.insert("amount".to_owned(), args.amount);
+        action_args.insert("mode".to_owned(), settlement_mode_dsl_value(args.mode));
+        Ok(ctx.action("damage", action_args))
+    }
+}
+
+pub struct SpawnProjectileDslNode;
+
+#[derive(Deserialize)]
+pub struct SpawnProjectileDslArgs {
+    prefab: String,
+    #[serde(default, deserialize_with = "optional_skill_node")]
+    on_hit: Option<SkillNode>,
+}
+
+impl SkillDslNode for SpawnProjectileDslNode {
+    const NAME: &'static str = "SpawnProjectile";
+    type Args = SpawnProjectileDslArgs;
+
+    fn lower(args: Self::Args, ctx: &mut SkillLowerContext<'_>) -> Result<SkillNode, SkillError> {
+        let mut action_args = DslArgs::new();
+        action_args.insert("prefab".to_owned(), DslValue::String(args.prefab));
+        if let Some(on_hit) = args.on_hit {
+            let (key, value) = ctx.payload_arg("on_hit", on_hit)?;
+            action_args.insert(key, value);
+        }
+        Ok(ctx.action("spawn_projectile", action_args))
+    }
+}
+
+pub struct ApplyBuffDslNode;
+
+#[derive(Deserialize)]
+pub struct ApplyBuffDslArgs {
+    buff: String,
+    #[serde(default, deserialize_with = "optional_f64")]
+    duration: Option<f64>,
+    #[serde(default, deserialize_with = "optional_skill_node")]
+    on_add: Option<SkillNode>,
+    #[serde(default, deserialize_with = "optional_skill_node")]
+    on_remove: Option<SkillNode>,
+}
+
+impl SkillDslNode for ApplyBuffDslNode {
+    const NAME: &'static str = "ApplyBuff";
+    type Args = ApplyBuffDslArgs;
+
+    fn lower(args: Self::Args, ctx: &mut SkillLowerContext<'_>) -> Result<SkillNode, SkillError> {
+        let mut action_args = DslArgs::new();
+        action_args.insert("buff".to_owned(), DslValue::String(args.buff));
+        if let Some(duration) = args.duration {
+            action_args.insert("duration".to_owned(), DslValue::Number(duration));
+        }
+        if let Some(on_add) = args.on_add {
+            let (key, value) = ctx.payload_arg("on_add", on_add)?;
+            action_args.insert(key, value);
+        }
+        if let Some(on_remove) = args.on_remove {
+            let (key, value) = ctx.payload_arg("on_remove", on_remove)?;
+            action_args.insert(key, value);
+        }
+        Ok(ctx.action("apply_buff", action_args))
+    }
+}
+
 pub fn register_gameplay_primitives(
     registry: &mut SkillRegistry,
     actions: &mut SkillActionRegistry,
@@ -339,7 +438,12 @@ pub fn register_gameplay_primitives(
         .register_skill_action("damage", DamageAction)
         .register_skill_action("apply_buff", ApplyBuffAction)
         .register_skill_action("spell", SpellAction);
-    registry.register_cast_model("wand_deck", WandDeckCastModel);
+    registry
+        .register_cast_model("wand_deck", WandDeckCastModel)
+        .register_dsl_node::<TraceDslNode>()
+        .register_dsl_node::<DamageDslNode>()
+        .register_dsl_node::<SpawnProjectileDslNode>()
+        .register_dsl_node::<ApplyBuffDslNode>();
 }
 
 fn spell_action(id: &str, args: &DslArgs, damage_bonus: f64) -> SkillNode {
@@ -382,4 +486,31 @@ fn settlement_mode(args: &SkillArgs) -> Result<SettlementMode, SkillError> {
             format!("unknown damage settlement mode `{other}`"),
         )),
     }
+}
+
+fn default_damage_mode() -> SettlementMode {
+    SettlementMode::Sync
+}
+
+fn settlement_mode_dsl_value(mode: SettlementMode) -> DslValue {
+    let value = match mode {
+        SettlementMode::Sync => "sync",
+        SettlementMode::Request => "request",
+        SettlementMode::Await => "await",
+    };
+    DslValue::String(value.to_owned())
+}
+
+fn optional_skill_node<'de, D>(deserializer: D) -> Result<Option<SkillNode>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    SkillNode::deserialize(deserializer).map(Some)
+}
+
+fn optional_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    f64::deserialize(deserializer).map(Some)
 }

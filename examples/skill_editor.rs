@@ -16,11 +16,12 @@ use bevy_skill_flow::editor::{
 };
 use bevy_skill_flow::{
     ActiveSkill, SkillAction, SkillActionOutput, SkillArgs, SkillCastRequest, SkillContext,
-    SkillDef, SkillDslPlugin, SkillError, SkillExpr, SkillId, SkillIntent, SkillLibrary, SkillNode,
-    SkillRegistry, SkillResult, SkillRuntimeSignal, SkillSpecialValue, SkillValue, StatModifier,
-    StatOp,
+    SkillDef, SkillDslNode, SkillDslPlugin, SkillError, SkillExpr, SkillId, SkillIntent,
+    SkillLibrary, SkillLowerContext, SkillNode, SkillRegistry, SkillResult, SkillRuntimeSignal,
+    SkillSpecialValue, SkillValue, StatModifier, StatOp,
 };
 use indexmap::IndexSet;
+use serde::{Deserialize, Deserializer};
 use std::fs;
 use std::path::Path;
 
@@ -285,6 +286,7 @@ fn setup_editor_library(
         .register_skill_action("mark_blast", MarkBlastAction)
         .register_skill_action("detonate_marked_blast", DetonateMarkedBlastAction)
         .register_skill_action("heal_or_shield", HealOrShieldAction);
+    register_demo_dsl_nodes(&mut registry);
     registry.register_skill_modifier(
         "fan_out",
         StatModifier::new(
@@ -307,6 +309,213 @@ fn setup_editor_library(
         log.lines.push(format!("load skills failed: {err}"));
     }
     refresh_skill_bar(&mut skill_bar, &editor);
+}
+
+fn register_demo_dsl_nodes(registry: &mut SkillRegistry) {
+    registry
+        .register_dsl_node::<SpawnProjectileDslNode>()
+        .register_dsl_node::<SpawnZoneDslNode>()
+        .register_dsl_node::<AreaDamageDslNode>()
+        .register_dsl_node::<CombatLogDslNode>()
+        .register_dsl_node::<MarkBlastDslNode>()
+        .register_dsl_node::<DetonateMarkedBlastDslNode>()
+        .register_dsl_node::<HealOrShieldDslNode>();
+}
+
+struct SpawnProjectileDslNode;
+
+#[derive(Deserialize)]
+struct SpawnProjectileDslArgs {
+    kind: String,
+    #[serde(default, deserialize_with = "optional_skill_value")]
+    count: Option<SkillValue>,
+    #[serde(default, deserialize_with = "optional_skill_value")]
+    damage: Option<SkillValue>,
+    #[serde(default, deserialize_with = "optional_skill_value")]
+    speed: Option<SkillValue>,
+    #[serde(default, deserialize_with = "optional_skill_value")]
+    radius: Option<SkillValue>,
+    #[serde(default, deserialize_with = "optional_skill_value")]
+    spread_degrees: Option<SkillValue>,
+    #[serde(default, deserialize_with = "optional_skill_value")]
+    hit_event: Option<SkillValue>,
+}
+
+impl SkillDslNode for SpawnProjectileDslNode {
+    const NAME: &'static str = "SpawnProjectile";
+    type Args = SpawnProjectileDslArgs;
+
+    fn lower(args: Self::Args, ctx: &mut SkillLowerContext<'_>) -> Result<SkillNode, SkillError> {
+        let mut action_args = SkillArgs::new();
+        action_args.insert("kind".to_owned(), SkillValue::String(args.kind));
+        insert_optional_arg(&mut action_args, "count", args.count);
+        insert_optional_arg(&mut action_args, "damage", args.damage);
+        insert_optional_arg(&mut action_args, "speed", args.speed);
+        insert_optional_arg(&mut action_args, "radius", args.radius);
+        insert_optional_arg(&mut action_args, "spread_degrees", args.spread_degrees);
+        insert_optional_arg(&mut action_args, "hit_event", args.hit_event);
+        Ok(ctx.action("spawn_projectile", action_args))
+    }
+}
+
+struct SpawnZoneDslNode;
+
+#[derive(Deserialize)]
+struct SpawnZoneDslArgs {
+    kind: String,
+    radius: SkillValue,
+    ttl: SkillValue,
+    trigger_event: String,
+}
+
+impl SkillDslNode for SpawnZoneDslNode {
+    const NAME: &'static str = "SpawnZone";
+    type Args = SpawnZoneDslArgs;
+
+    fn lower(args: Self::Args, ctx: &mut SkillLowerContext<'_>) -> Result<SkillNode, SkillError> {
+        let mut action_args = SkillArgs::new();
+        action_args.insert("kind".to_owned(), SkillValue::String(args.kind));
+        action_args.insert("radius".to_owned(), args.radius);
+        action_args.insert("ttl".to_owned(), args.ttl);
+        action_args.insert(
+            "trigger_event".to_owned(),
+            SkillValue::String(args.trigger_event),
+        );
+        Ok(ctx.action("spawn_zone", action_args))
+    }
+}
+
+struct AreaDamageDslNode;
+
+#[derive(Deserialize)]
+struct AreaDamageDslArgs {
+    x: SkillValue,
+    y: SkillValue,
+    radius: SkillValue,
+    amount: SkillValue,
+    kind: String,
+}
+
+impl SkillDslNode for AreaDamageDslNode {
+    const NAME: &'static str = "AreaDamage";
+    type Args = AreaDamageDslArgs;
+
+    fn lower(args: Self::Args, ctx: &mut SkillLowerContext<'_>) -> Result<SkillNode, SkillError> {
+        let mut action_args = SkillArgs::new();
+        action_args.insert("x".to_owned(), args.x);
+        action_args.insert("y".to_owned(), args.y);
+        action_args.insert("radius".to_owned(), args.radius);
+        action_args.insert("amount".to_owned(), args.amount);
+        action_args.insert("kind".to_owned(), SkillValue::String(args.kind));
+        Ok(ctx.action("area_damage", action_args))
+    }
+}
+
+struct CombatLogDslNode;
+
+#[derive(Deserialize)]
+struct CombatLogDslArgs {
+    message: String,
+}
+
+impl SkillDslNode for CombatLogDslNode {
+    const NAME: &'static str = "CombatLog";
+    type Args = CombatLogDslArgs;
+
+    fn lower(args: Self::Args, ctx: &mut SkillLowerContext<'_>) -> Result<SkillNode, SkillError> {
+        let mut action_args = SkillArgs::new();
+        action_args.insert("message".to_owned(), SkillValue::String(args.message));
+        Ok(ctx.action("combat_log", action_args))
+    }
+}
+
+struct MarkBlastDslNode;
+
+#[derive(Deserialize)]
+struct MarkBlastDslArgs {
+    radius: SkillValue,
+    delay: SkillValue,
+}
+
+impl SkillDslNode for MarkBlastDslNode {
+    const NAME: &'static str = "MarkBlast";
+    type Args = MarkBlastDslArgs;
+
+    fn lower(args: Self::Args, ctx: &mut SkillLowerContext<'_>) -> Result<SkillNode, SkillError> {
+        let mut action_args = SkillArgs::new();
+        action_args.insert("radius".to_owned(), args.radius);
+        action_args.insert("delay".to_owned(), args.delay);
+        Ok(ctx.action("mark_blast", action_args))
+    }
+}
+
+struct DetonateMarkedBlastDslNode;
+
+#[derive(Deserialize)]
+struct DetonateMarkedBlastDslArgs {
+    radius: SkillValue,
+    amount: SkillValue,
+}
+
+impl SkillDslNode for DetonateMarkedBlastDslNode {
+    const NAME: &'static str = "DetonateMarkedBlast";
+    type Args = DetonateMarkedBlastDslArgs;
+
+    fn lower(args: Self::Args, ctx: &mut SkillLowerContext<'_>) -> Result<SkillNode, SkillError> {
+        let mut action_args = SkillArgs::new();
+        action_args.insert("radius".to_owned(), args.radius);
+        action_args.insert("amount".to_owned(), args.amount);
+        Ok(ctx.action("detonate_marked_blast", action_args))
+    }
+}
+
+struct HealOrShieldDslNode;
+
+#[derive(Clone, Copy, Deserialize)]
+enum HealOrShieldMode {
+    Heal,
+    Shield,
+}
+
+#[derive(Deserialize)]
+struct HealOrShieldDslArgs {
+    amount: SkillValue,
+    mode: HealOrShieldMode,
+}
+
+impl SkillDslNode for HealOrShieldDslNode {
+    const NAME: &'static str = "HealOrShield";
+    type Args = HealOrShieldDslArgs;
+
+    fn lower(args: Self::Args, ctx: &mut SkillLowerContext<'_>) -> Result<SkillNode, SkillError> {
+        let mut action_args = SkillArgs::new();
+        action_args.insert("amount".to_owned(), args.amount);
+        action_args.insert(
+            "mode".to_owned(),
+            SkillValue::String(heal_or_shield_mode(args.mode).to_owned()),
+        );
+        Ok(ctx.action("heal_or_shield", action_args))
+    }
+}
+
+fn insert_optional_arg(args: &mut SkillArgs, key: &str, value: Option<SkillValue>) {
+    if let Some(value) = value {
+        args.insert(key.to_owned(), value);
+    }
+}
+
+fn optional_skill_value<'de, D>(deserializer: D) -> Result<Option<SkillValue>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    SkillValue::deserialize(deserializer).map(Some)
+}
+
+fn heal_or_shield_mode(mode: HealOrShieldMode) -> &'static str {
+    match mode {
+        HealOrShieldMode::Heal => "heal",
+        HealOrShieldMode::Shield => "shield",
+    }
 }
 
 fn editor_ui(
@@ -1070,6 +1279,12 @@ fn edit_skill_node(ui: &mut egui::Ui, node: &mut SkillNode, id: &str) -> bool {
             });
             changed |= edit_args_map(ui, "Args", args, &format!("{id}_modifier_args"));
         }
+        SkillNode::Typed { name, .. } => {
+            ui.horizontal(|ui| {
+                ui.label("Typed");
+                ui.label(name.as_str());
+            });
+        }
     }
     changed
 }
@@ -1170,6 +1385,7 @@ enum SkillNodeKind {
     Deck,
     Spell,
     Modifier,
+    Typed,
 }
 
 const NODE_KINDS: [SkillNodeKind; 12] = [
@@ -1201,6 +1417,7 @@ fn node_kind(node: &SkillNode) -> SkillNodeKind {
         SkillNode::Deck(_) => SkillNodeKind::Deck,
         SkillNode::Spell(_, _) => SkillNodeKind::Spell,
         SkillNode::Modifier(_, _) => SkillNodeKind::Modifier,
+        SkillNode::Typed { .. } => SkillNodeKind::Typed,
     }
 }
 
@@ -1218,6 +1435,7 @@ fn node_kind_label(kind: SkillNodeKind) -> &'static str {
         SkillNodeKind::Deck => "Deck",
         SkillNodeKind::Spell => "Spell",
         SkillNodeKind::Modifier => "Modifier",
+        SkillNodeKind::Typed => "Typed",
     }
 }
 
@@ -1254,6 +1472,7 @@ fn default_node(kind: SkillNodeKind) -> SkillNode {
         SkillNodeKind::Deck => SkillNode::Deck(vec![default_node(SkillNodeKind::Spell)]),
         SkillNodeKind::Spell => SkillNode::Spell("spell".to_owned(), SkillArgs::new()),
         SkillNodeKind::Modifier => SkillNode::Modifier("modifier".to_owned(), SkillArgs::new()),
+        SkillNodeKind::Typed => SkillNode::Action("trace".to_owned(), SkillArgs::new()),
     }
 }
 
@@ -2212,22 +2431,22 @@ const DEFAULT_SKILLS: &[(&str, &str)] = &[
   modifiers: ["fan_out"],
   body: Sequence([
     Emit("skill_cast", { "label": "Split Fireball" }),
-    Action("spawn_projectile", {
-      "kind": "fire",
-      "count": Expr("stat.projectile_count"),
-      "damage": Expr("stat.base_damage * stat.projectile_damage"),
-      "speed": 540.0,
-      "radius": 18.0,
-      "spread_degrees": Expr("stat.projectile_spread_degrees"),
-      "hit_event": "fireball_hit",
-    }),
-    On("fireball_hit", Action("area_damage", {
-      "x": Expr("event.x"),
-      "y": Expr("event.y"),
-      "radius": 62.0,
-      "amount": 12.0,
-      "kind": "burn",
-    })),
+    SpawnProjectile(
+      kind: "fire",
+      count: Expr("stat.projectile_count"),
+      damage: Expr("stat.base_damage * stat.projectile_damage"),
+      speed: 540.0,
+      radius: 18.0,
+      spread_degrees: Expr("stat.projectile_spread_degrees"),
+      hit_event: "fireball_hit",
+    ),
+    On("fireball_hit", AreaDamage(
+      x: Expr("event.x"),
+      y: Expr("event.y"),
+      radius: 62.0,
+      amount: 12.0,
+      kind: "burn",
+    )),
   ]),
 )
 "#,
@@ -2243,16 +2462,16 @@ const DEFAULT_SKILLS: &[(&str, &str)] = &[
   },
   body: Sequence([
     Emit("skill_cast", { "label": "Delayed Blast" }),
-    Action("mark_blast", {
-      "radius": Expr("stat.blast_radius"),
-      "delay": 0.7,
-    }),
+    MarkBlast(
+      radius: Expr("stat.blast_radius"),
+      delay: 0.7,
+    ),
     Delay(Expr("0.7"), Parallel([
-      Action("detonate_marked_blast", {
-        "radius": Expr("stat.blast_radius"),
-        "amount": Expr("stat.blast_damage"),
-      }),
-      Action("heal_or_shield", { "amount": 8.0, "mode": "shield" }),
+      DetonateMarkedBlast(
+        radius: Expr("stat.blast_radius"),
+        amount: Expr("stat.blast_damage"),
+      ),
+      HealOrShield(amount: 8.0, mode: Shield),
       Emit("blast_ready", { "label": "blast detonated" }),
     ])),
   ]),
@@ -2270,21 +2489,21 @@ const DEFAULT_SKILLS: &[(&str, &str)] = &[
   },
   body: Sequence([
     Emit("skill_cast", { "label": "Arc Trap" }),
-    Action("spawn_zone", {
-      "kind": "trap",
-      "radius": Expr("stat.trap_radius"),
-      "ttl": 5.0,
-      "trigger_event": "trap_triggered",
-    }),
+    SpawnZone(
+      kind: "trap",
+      radius: Expr("stat.trap_radius"),
+      ttl: 5.0,
+      trigger_event: "trap_triggered",
+    ),
     On("trap_triggered", Parallel([
-      Action("area_damage", {
-        "x": Expr("event.x"),
-        "y": Expr("event.y"),
-        "radius": Expr("stat.trap_radius"),
-        "amount": Expr("stat.trap_damage"),
-        "kind": "shock",
-      }),
-      Action("combat_log", { "message": "trap triggered" }),
+      AreaDamage(
+        x: Expr("event.x"),
+        y: Expr("event.y"),
+        radius: Expr("stat.trap_radius"),
+        amount: Expr("stat.trap_damage"),
+        kind: "shock",
+      ),
+      CombatLog(message: "trap triggered"),
     ])),
   ]),
 )
@@ -2305,14 +2524,14 @@ const DEFAULT_SKILLS: &[(&str, &str)] = &[
       times: Some(Expr("stat.burst_count")),
       interval: Some(Expr("0.08")),
       node: Parallel([
-        Action("spawn_projectile", {
-          "kind": "bolt",
-          "count": 1.0,
-          "damage": Expr("stat.shot_damage"),
-          "speed": 700.0,
-          "radius": 10.0,
-          "spread_degrees": 5.0,
-        }),
+        SpawnProjectile(
+          kind: "bolt",
+          count: 1.0,
+          damage: Expr("stat.shot_damage"),
+          speed: 700.0,
+          radius: 10.0,
+          spread_degrees: 5.0,
+        ),
         Emit("burst_tick", { "label": "burst projectile" }),
       ]),
     ),

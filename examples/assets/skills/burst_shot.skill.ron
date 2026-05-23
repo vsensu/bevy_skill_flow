@@ -11,14 +11,14 @@ Skill(
       times: Some(Expr("stat.burst_count")),
       interval: Some(Expr("0.08")),
       node: Parallel([
-        Action("spawn_projectile", {
-          "kind": "bolt",
-          "count": 1.0,
-          "damage": Expr("stat.shot_damage"),
-          "speed": 700.0,
-          "radius": 10.0,
-          "spread_degrees": 5.0,
-        }),
+        SpawnProjectile(
+          kind: "bolt",
+          count: 1.0,
+          damage: Expr("stat.shot_damage"),
+          speed: 700.0,
+          radius: 10.0,
+          spread_degrees: 5.0,
+        ),
         Emit("burst_tick", { "label": "burst projectile" }),
       ]),
     ),

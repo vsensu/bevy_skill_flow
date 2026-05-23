@@ -129,6 +129,155 @@ fn compile_and_runtime_reject_unknown_primitives_at_their_boundary() {
 }
 
 #[test]
+fn typed_damage_lowers_to_damage_action() {
+    let skill = parse_skill_def(
+        r#"
+        Skill(
+          id: "typed_damage",
+          body: Damage(amount: Expr("stat.damage"), mode: Sync),
+        )
+    "#,
+    )
+    .unwrap();
+    assert!(matches!(
+        &skill.body,
+        bevy_skill_flow::SkillNode::Typed { name, .. } if name == "Damage"
+    ));
+
+    let compiled = compile_skill(&skill, &registry()).unwrap();
+    let root = compiled.graph.node(compiled.graph.root.unwrap()).unwrap();
+    let SkillGraphNodeKind::Extension { constructor, args } = &root.kind else {
+        panic!("expected extension node");
+    };
+    assert_eq!(constructor, "damage");
+    assert_eq!(
+        args.get("amount"),
+        Some(&EcsSkillValue::Special(
+            bevy_skill_ecs::SkillSpecialValue::Expr("stat.damage".to_owned())
+        ))
+    );
+    assert_eq!(
+        args.get("mode"),
+        Some(&EcsSkillValue::String("sync".to_owned()))
+    );
+}
+
+#[test]
+fn unregistered_typed_node_reports_unknown_dsl_node() {
+    let skill = parse_skill_def(
+        r#"
+        Skill(
+          id: "typed_damage",
+          body: Damage(amount: 10.0, mode: Sync),
+        )
+    "#,
+    )
+    .unwrap();
+
+    let err = compile_skill(&skill, &SkillRegistry::with_core()).unwrap_err();
+    assert_eq!(err, SkillError::UnknownDslNode("Damage".to_owned()));
+}
+
+#[test]
+fn typed_nodes_lower_inside_control_flow_and_payloads() {
+    let skill = parse_skill_def(
+        r#"
+        Skill(
+          id: "typed_nested",
+          body: Sequence([
+            If(
+              condition: Expr("true"),
+              then_node: Damage(amount: 7.0),
+            ),
+            On("hit", Trace(label: "hit")),
+            Action("spawn_projectile", {
+              "on_hit": Damage(amount: 11.0, mode: Request),
+            }),
+          ]),
+        )
+    "#,
+    )
+    .unwrap();
+
+    let compiled = compile_skill(&skill, &registry()).unwrap();
+    compiled.graph.validate().unwrap();
+    let root = compiled.graph.node(compiled.graph.root.unwrap()).unwrap();
+    let children = root.children.get("items").unwrap();
+    assert_eq!(children.len(), 3);
+
+    let if_node = compiled.graph.node(children[0]).unwrap();
+    let then = if_node.children.get("then").unwrap()[0];
+    assert_extension(&compiled.graph, then, "damage");
+
+    let wait = compiled.graph.node(children[1]).unwrap();
+    let hit_payload = wait.payloads.get("hit").unwrap()[0];
+    assert_extension(&compiled.graph, hit_payload, "trace");
+
+    let projectile = compiled.graph.node(children[2]).unwrap();
+    let on_hit = projectile.payloads.get("on_hit").unwrap()[0];
+    assert_extension(&compiled.graph, on_hit, "damage");
+}
+
+#[test]
+fn typed_fireball_compiles_payload_relationships() {
+    let skill = parse_skill_def(
+        r#"
+        Skill(
+          id: "typed_fireball",
+          params: { "damage": 40.0, "burn_damage": 8.0 },
+          body: Sequence([
+            SpawnProjectile(
+              prefab: "fireball",
+              on_hit: On("hit", Sequence([
+                Damage(amount: Expr("stat.damage"), mode: Sync),
+                ApplyBuff(
+                  buff: "burning",
+                  duration: 3.0,
+                  on_add: Damage(amount: Expr("stat.burn_damage"), mode: Sync),
+                  on_remove: Trace(label: "burn ended"),
+                ),
+              ])),
+            ),
+          ]),
+        )
+    "#,
+    )
+    .unwrap();
+
+    let compiled = compile_skill(&skill, &registry()).unwrap();
+    compiled.graph.validate().unwrap();
+    let root = compiled.graph.node(compiled.graph.root.unwrap()).unwrap();
+    let projectile_id = root.children.get("items").unwrap()[0];
+    assert_extension(&compiled.graph, projectile_id, "spawn_projectile");
+
+    let projectile = compiled.graph.node(projectile_id).unwrap();
+    let wait_id = projectile.payloads.get("on_hit").unwrap()[0];
+    let wait = compiled.graph.node(wait_id).unwrap();
+    assert!(matches!(
+        &wait.kind,
+        SkillGraphNodeKind::WaitEvent { event } if event == "hit"
+    ));
+
+    let sequence_id = wait.payloads.get("hit").unwrap()[0];
+    let sequence = compiled.graph.node(sequence_id).unwrap();
+    let hit_nodes = sequence.children.get("items").unwrap();
+    assert_extension(&compiled.graph, hit_nodes[0], "damage");
+    assert_extension(&compiled.graph, hit_nodes[1], "apply_buff");
+
+    let buff = compiled.graph.node(hit_nodes[1]).unwrap();
+    assert_extension(
+        &compiled.graph,
+        buff.payloads.get("on_add").unwrap()[0],
+        "damage",
+    );
+    assert_extension(
+        &compiled.graph,
+        buff.payloads.get("on_remove").unwrap()[0],
+        "trace",
+    );
+}
+
+#[test]
 fn expr_eval_supports_paths_math_comparison_and_nullish() {
     let skill = compiled_with_stats(vec![
         ("base_damage".to_owned(), SkillValue::Number(40.0)),
@@ -1500,7 +1649,7 @@ mod editor_tests {
         );
 
         editor.edit_source(
-            r#"Skill(id: "live", body: Action("missing", {}))"#.to_owned(),
+            r#"Skill(id: "live", modifiers: ["missing"], body: Action("trace", {}))"#.to_owned(),
             &registry,
             &mut library,
         );

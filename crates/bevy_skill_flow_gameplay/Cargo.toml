@@ -8,3 +8,4 @@ bevy = { version = "0.18.1", default-features = false }
 bevy_skill_ecs = { path = "../bevy_skill_ecs" }
 bevy_skill_flow = { path = "../.." }
 indexmap = "2.7"
+serde = { version = "1", features = ["derive"] }

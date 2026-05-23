@@ -32,6 +32,8 @@ pub enum SkillError {
     UnknownModifier(String),
     #[error("cast model `{0}` is not registered")]
     UnknownCastModel(String),
+    #[error("DSL node `{0}` is not registered")]
+    UnknownDslNode(String),
     #[error("expression `{expr}` failed: {message}")]
     Expr { expr: String, message: String },
     #[error("runtime error: {0}")]
